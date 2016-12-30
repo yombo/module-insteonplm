@@ -73,8 +73,9 @@ from twisted.internet.protocol import Protocol
 from twisted.internet.serialport import SerialPort
 
 from yombo.core.module import YomboModule
+from yombo.core.helpers import getComponent, sleep
 from yombo.core.log import get_logger
-from yombo.utils.lookupdict import LookupDict
+from yombo.core.lookupdict import LookupDict
 
 logger = get_logger("modules.insteonplm")
 
@@ -106,29 +107,6 @@ def simpleMap(value, in_min, in_max, out_min, out_max):
     #stolen from the arduino implimentation.  I am sure there is a nice python way to do it, but I have yet to stublem across it
     return (float(value) - float(in_min)) * (float(out_max) - float(out_min)) / (float(in_max) - float(in_min)) + float(out_min);
 
-
-class State(object):
-    ALL = 'all'
-    UNKNOWN = 'unknown'
-    ON = 'on'
-    OFF = 'off'
-    LEVEL = 'level'
-    SETPOINT = 'setpoint'
-    MOTION = 'motion'
-    STILL = 'still'
-    OPEN = 'open'
-    CLOSED = "close"
-    LIGHT = "light"
-    DARK = "dark"
-    ACTIVE = 'active'
-    INACTIVE = 'inactive'
-    OCCUPIED = 'occupied'
-    VACANT = 'vacant'
-    HEAT = 'heat'
-    COOL = 'cool'
-    CIRCULATE = 'circulate'
-    AUTOMATIC = 'automatic'
-    HOLD = 'hold'
 
 '''
 KEYPADLINC Information
@@ -190,36 +168,30 @@ class InsteonPLM(YomboModule):
     lastUnit = ""		# last seen X10 unit code
 
     def _init_(self):
-        # logger.info("&&&&: Insteon Module Devices: %s" % self._Devices)
-        # logger.info("&&&&: Insteon Module DeviceTypes: %s" % self._DeviceTypes)
+        return
+
+        logger.info("&&&&: Insteon Module Devices: %s" % self._Devices)
+        logger.info("&&&&: Insteon Module DeviceTypes: %s" % self._DeviceTypes)
         self._ModDescription = "Insteon command interface"
         self._ModAuthor = "Mitch Schwenk @ Yombo"
         self._ModUrl = "http://www.yombo.net"
 
         self.startable = False # track when load has completed...
+        self.sendQueueMessages = {} # Stores original incoming messages while command is sent to HV. Used for replys.
+
+        self.PLMProtocol = None  # set by the PLM protocol
+        self.x10stack = {} # used to track house/unit codes before a command.
+        self.lastHouseCode = None  # Track last x10 house codes received
         self.pending = False
         self.queue = deque()
         self.checkQueueLoop = LoopingCall(self.checkQueue)
-        self.writeloop = LoopingCall(self._writeInterface)
+
         self._outboundQueue = deque()
         self._outboundCommandDetails = dict()
         self._retryCount = dict()
-        self._readBuffer = ''
-        self._serialProtocol = None
+
         #pytomation items
         # Response sizes do not include the start of message (0x02) and the command
-        self._pendingCommandDetails = dict()
-        self._outboundQueue = deque()
-        self._outboundCommandDetails = dict()
-        self._retryCount = dict()
-        self._commandReturnData = dict()
-
-        self._intersend_delay = 0.15  # 150 ms between network sends
-        self._lastSendTime = 0
-
-        self._commandDelegates = []
-        self._devices = []
-        self._lastPacketHash = None
         self._modemCommands = {'60': {  # Get IM Info
                                     'responseSize' : 7,
                                     'callBack' : self._process_PLMInfo
@@ -506,17 +478,31 @@ class InsteonPLM(YomboModule):
         self.insteonCmds = {}
 
     def _load_(self):
-        self.APIModule = self._Modules['InsteonAPI']
-        logger.debug("######== {modvars}", modvars=self._ModuleVariables);
+        return
+        return self._reload_(type='all')
+
+    def _reload_(self, **kwargs):
+        self.InsteonAPIModule = getComponent("yombo.gateway.modules.InsteonAPI")
+        logger.debug("######== {modvars}", modvars=self._ModVariables);
 
         self.PLMType = "serial"  #serial, network, etc etc later...
-        print self._ModuleVariables
-        self.PLMAddress = self._ModuleVariables['port']['data'][0]['value']
+        self.PLMAddress = self._ModuleVariables['portPath']['value'][0]
 
 #todo: convert to exception
         if self.PLMAddress is None:
             logger.error("InsteonPLM cannot load, PLM address empty.")
             return
+
+        try:
+            self.X10APIModule = getComponent("yombo.gateway.modules.X10API")
+            self.x10support = True
+#            logger.warn("aaaa3: {mdt}", mdt=self.X10APIModule._DeviceTypes)
+            self.HVDevices['x10']= self.X10APIModule.x10devices
+        except:
+            # no X10API module!
+            logger.warn("Homevision - Disable suppot for X10 - X10API module not found!")
+            self.x10support = False
+
         return self._startConnection()
 
     def _startConnection(self):
@@ -525,12 +511,12 @@ class InsteonPLM(YomboModule):
         """
         if self.PLMType == "serial":
           try:
-            self.SerialInterface = SerialPort(InsteonPLMSerialProtocol(self), self.PLMAddress, reactor, baudrate='19200')
+            self.SerialInterface = SerialPort(InsteonPLMSerialProtocol(self), self.PLMAddress, reactor, baudrate=self._baudrate)
             self._connected = True
           except SerialException, error:
             self._attempts += 1
-#            if self._attempts % 50 ==1:
-#                logger.warn("Unable to connect to InsteonPLM serial port. Will continue trying. Attempt: {attempts}, Reason: {error}", attempts=self._attempts, error=error)
+            if self._attempts % 10 ==1:
+                logger.warn("Unable to connect to InsteonPLM serial port. Will continue trying. Attempt: {attempts}, Reason: {error}", reason=self._attempts, error=error)
             reactor.callLater(self._interval, self._startConnection)
           self.__running = True
           self.__loaded = True
@@ -547,7 +533,6 @@ class InsteonPLM(YomboModule):
         self._hasStarted = True
         if self._connected is True:
             self.checkQueueLoop.start(2)
-            self.writeloop.start(0.1)
 
     def _stop_(self):
         pass
@@ -558,7 +543,7 @@ class InsteonPLM(YomboModule):
         self.__running = False
         return
 
-    def insteonapi_send_command(self, insteonCmd):
+    def sendInsteonCmd(self, insteonCmd):
         """
         Commands from Insteon API come into here. They need to be processed
         and sent to interface.
@@ -566,9 +551,39 @@ class InsteonPLM(YomboModule):
 #        logger.debug("x10cmds: %s", self.APIModule.x10cmds)
 
         self.insteonCmds[insteonCmd.originalMessage.msgUUID] = insteonCmd
-        logger.debug("insteonCommnd: {icmd}", icmd=insteonCmd.deviceobj)
+        logger.warn("insteonCommnd: {icmd}", icmd=insteonCmd.dump())
 
-        self.command(insteonCmd)
+#        self.PLMSerialSend(plmCommand, insteonCmd.originalMessage)
+
+    def PLMSerialSend(self, cmd, message):
+        """
+        Send a command to PLM serial. Stores the original message so a reply can be generated when PLM responds.
+
+        :param cmd: The string command to send to PLM.
+        :type cmd: string
+        :param message: The original message that was sent into Homevision for processing
+        :type mssage: A yombo message
+        """
+        self.sendQueueMessages[message.msgUUID] = message
+        self.HVProtocol.sendQueueAdd(message.msgUUID, cmd)
+
+    def PLMSerialOutput(self, msgUUID, result, lastCommand):
+        """
+        Called when we receive output from PLM serial.
+        """
+        logger.debug("PLMSerialOutput: {msgUUID}, {result}, {lastCommand}", msgUUID=msgUUID, result=result, lastCommand=lastCommand)
+        if msgUUID in self.sendQueueMessages:
+            logger.debug("HVSerialOutput2 = {msg}", msg=self.sendQueueMessages[msgUUID].payload)
+        msgStatus = ''
+        msgStatusExtra = ''
+        textStatus = ''
+        lastCommand = str(lastCommand)
+        statusUpdated = False
+
+        statusExtra = None
+        textStatus = None
+
+        a = result.split(" ")
 
     def checkQueue(self):
         if self.pending is False:
@@ -584,7 +599,7 @@ class InsteonPLM(YomboModule):
             logger.error("Unable to wait without a valid commandExecutionDetails parameter")
             return False
 
-        # waitEvent = commandExecutionDetails['waitEvent']
+        waitEvent = commandExecutionDetails['waitEvent']
         commandHash = commandExecutionDetails['commandHash']
 
         realTimeout = 2  # default timeout of 2 seconds
@@ -593,49 +608,50 @@ class InsteonPLM(YomboModule):
 
         timeoutOccured = False
 
-        # sleep(realTimeout)
+        sleep(realTimeout)
 
-        # if not timeoutOccured:
-        #     if commandHash in self._commandReturnData:
-        #         return self._commandReturnData[commandHash]
-        #     else:
-        #         return True
-        # else:
+        if not timeoutOccured:
+            if commandHash in self._commandReturnData:
+                return self._commandReturnData[commandHash]
+            else:
+                return True
+        else:
             #re-queue the command to try again
-            # self._commandLock.acquire()
+            self._commandLock.acquire()
 
-        if self._retryCount[commandHash] >= 5:
-            #too many retries.  Bail out
-            # self._commandLock.release()
-            return False
+            if self._retryCount[commandHash] >= 5:
+                #too many retries.  Bail out
+                self._commandLock.release()
+                return False
 
-#        logger.debug("Timed out for {commandhash}            (commandHash, self._retryCount[commandHash]))
+            self._logger.debug("Timed out for %s - Requeueing (already had %d retries)" % \
+                (commandHash, self._retryCount[commandHash]))
 
-        requiresRetry = True
-        if commandHash in self._pendingCommandDetails:
-            self._outboundCommandDetails[commandHash] = \
-                self._pendingCommandDetails[commandHash]
+            requiresRetry = True
+            if commandHash in self._pendingCommandDetails:
+                self._outboundCommandDetails[commandHash] = \
+                    self._pendingCommandDetails[commandHash]
 
-            del self._pendingCommandDetails[commandHash]
+                del self._pendingCommandDetails[commandHash]
 
-            self._outboundQueue.append(commandHash)
-            self._retryCount[commandHash] += 1
-        else:
-            logger.debug("Interesting.  timed out for {commandHash}, but there are no pending command details", commandHash=commandHash)
-            #to prevent a huge loop here we bail out
-            requiresRetry = False
+                self._outboundQueue.append(commandHash)
+                self._retryCount[commandHash] += 1
+            else:
+                self._logger.debug("Interesting.  timed out for %s, but there are no pending command details" % commandHash)
+                #to prevent a huge loop here we bail out
+                requiresRetry = False
 
-        # try:
-        #     self._logger.debug("Removing Lock " + str( self._commandLock))
-        #     # self._commandLock.release()
-        # except:
-        #     self._logger.error("Could not release Lock! " + str(self._commandLock))
+            try:
+                self._logger.debug("Removing Lock " + str( self._commandLock))
+                self._commandLock.release()
+            except:
+                self._logger.error("Could not release Lock! " + str(self._commandLock))
 
-        if requiresRetry:
-            return self._waitForCommandToFinish(commandExecutionDetails,
-                                                timeout=timeout)
-        else:
-            return False
+            if requiresRetry:
+                return self._waitForCommandToFinish(commandExecutionDetails,
+                                                    timeout=timeout)
+            else:
+                return False
 
 
     def _sendInterfaceCommand(self, modemCommand, commandDataString = None, extraCommandDetails = None):
@@ -668,7 +684,7 @@ class InsteonPLM(YomboModule):
                 self._outboundQueue.append(commandHash)
                 self._retryCount[commandHash] = 0
 
-                logger.debug("Queued: {commandHash}", commandHash=commandHash)
+                logger.info("Queued: {commandHash}", commandHash=commandHash)
 
                 returnValue = {'commandHash': commandHash}
 
@@ -677,51 +693,10 @@ class InsteonPLM(YomboModule):
 
         return returnValue
 
-    def _writeInterface(self):
-        #check to see if there are any outbound messages to deal with
-        # self._commandLock.acquire()
-        if self._outboundQueue and (len(self._outboundQueue) > 0) and \
-            (time.time() - self._lastSendTime > self._intersend_delay):
-            commandHash = self._outboundQueue.popleft()
-
-            try:
-                commandExecutionDetails = self._outboundCommandDetails[commandHash]
-            except Exception, ex:
-                logger.error('Could not find execution details: {command} {error}'.format(
-                                                                                                command=commandHash,
-                                                                                                error=str(ex))
-                                   )
-            else:
-                bytesToSend = commandExecutionDetails['bytesToSend']
-
-    #            self._logger.debug("Transmit>" + str(hex_dump(bytesToSend, len(bytesToSend))))
-                try:
-                    logger.debug("Transmit>" + Conversions.ascii_to_hex(bytesToSend))
-                except:
-                    logger.debug("Transmit>" + str(bytesToSend))
-
-#                result = self._interface.write(bytesToSend)
-                result = self._writeInterfaceFinal(bytesToSend)
-                logger.debug("TransmitResult>" + str(result))
-
-                self._pendingCommandDetails[commandHash] = commandExecutionDetails
-                del self._outboundCommandDetails[commandHash]
-
-                self._lastSendTime = time.time()
-
-        # try:
-        #     self._commandLock.release()
-        # except Exception, te:
-        #     self._logger.debug("Error trying to release unlocked lock %s" % (str(te)))
-
-    def _writeInterfaceFinal(self, data):
-        return self._serialProtocol.send(data)
-
-
     def _readInterface(self, lastPacketHash):
         #check to see if there is anyting we need to read
-        firstByte = self._serialProtocol.readData(1)
-        logger.debug("firstByte: {firstByte}", firstByte=firstByte)
+        firstByte = self.PLMProtocol.readData(1)
+        logger.warn("firstByte: {firstByte}", firstByte=firstByte)
 #        return
 
         try:
@@ -731,8 +706,8 @@ class InsteonPLM(YomboModule):
                 if firstByte[0] == '\x02':
                     #modem command (could be an echo or a response)
                     #read another byte to sort that out
-                    secondByte = self._serialProtocol.readData(1)
-                    logger.debug("secondByte: {secondByte}", secondByte=secondByte)
+                    secondByte = self.PLMProtocol.readData(1)
+                    logger.warn("secondByte: {secondByte}", secondByte=secondByte)
 
                     responseSize = -1
                     callBack = None
@@ -749,7 +724,7 @@ class InsteonPLM(YomboModule):
                     else:
                         # set the callback and response size expected for standard commands
                         modemCommand = binascii.hexlify(secondByte).upper()
-                        logger.debug("bbb: modemCommand= {modemCommand}", modemCommand=modemCommand)
+                        logger.warn("bbb: modemCommand= {modemCommand}", modemCommand=modemCommand)
 
                         if self._modemCommands.has_key(modemCommand):
                             if self._modemCommands[modemCommand].has_key('responseSize'):
@@ -758,22 +733,22 @@ class InsteonPLM(YomboModule):
                                 callBack = self._modemCommands[modemCommand]['callBack']
 
                     if responseSize != -1:
-                        remainingBytes = self._serialProtocol.readData(responseSize)
-                        logger.debug("{responseSize} remainingBytes: {remainingBytes}", responseSize=responseSize, remainingBytes=remainingBytes)
+                        remainingBytes = self.PLMProtocol.readData(responseSize)
+                        logger.warn("{responseSize} remainingBytes: {remainingBytes}", responseSize=responseSize, remainingBytes=remainingBytes)
                         currentPacketHash = hashPacket(firstByte + secondByte + remainingBytes)
                         logger.debug("Receive< " + self.hex_dump(firstByte + secondByte + remainingBytes, len(firstByte + secondByte + remainingBytes)) + currentPacketHash + "\n")
 
                         if lastPacketHash and lastPacketHash == currentPacketHash:
-                            logger.debug("bbb")
+                            logger.warn("bbb")
                             #duplicate packet.  Ignore
                             pass
                         else:
-                            logger.debug("ccc")
+                            logger.warn("ccc")
                             if callBack:
-                                logger.debug("ddd")
+                                logger.warn("ddd")
                                 callBack(firstByte + secondByte + remainingBytes)
                             else:
-                                logger.debug("eee")
+                                logger.warn("eee")
                                 logger.debug("No callBack defined for for modem command {modemCommand}", modemCommand=modemCommand)
 
                         self._lastPacketHash = currentPacketHash
@@ -795,9 +770,6 @@ class InsteonPLM(YomboModule):
 
             else:
                 self._checkCommandQueue()
-                #print "Sleeping"
-                #X10 is slow.  Need to adjust based on protocol sent.  Or pay attention to NAK and auto adjust
-                # sleep(self.spinTime)
         except TypeError, ex:
             pass
 
@@ -843,8 +815,8 @@ class InsteonPLM(YomboModule):
                 #self._commandReturnData[commandHash] = { 'id': _byteIdToStringId(idHigh,idMid,idLow), 'deviceCategory': '%02X' % deviceCat, 'deviceSubCategory': '%02X' % deviceSubCat, 'firmwareVersion': '%02X' % firmwareVer }
                 self.plmAddress = _byteIdToStringId(idHigh,idMid,idLow).upper()
 
-#                waitEvent = commandDetails['waitEvent']
-#                waitEvent.set()
+                waitEvent = commandDetails['waitEvent']
+                waitEvent.set()
 
                 foundCommandHash = commandHash
                 break
@@ -960,11 +932,11 @@ class InsteonPLM(YomboModule):
                                 if extraReturnData:
                                     returnData = dict(returnData.items() + extraReturnData.items())
 
-#                                if requestCycleDone:
-#                                    waitEvent = commandDetails['waitEvent']
+                                if requestCycleDone:
+                                    waitEvent = commandDetails['waitEvent']
                             else:
                                 logger.warn("No callBack for insteon command code {insteonCommandCode}", insteonCommandCode=insteonCommandCode)
-#                                waitEvent = commandDetails['waitEvent']
+                                waitEvent = commandDetails['waitEvent']
                         else:
                             logger.warn("No insteonCommand lookup defined for insteon command code {insteonCommandCode}", insteonCommandCode=insteonCommandCode)
 
@@ -981,9 +953,8 @@ class InsteonPLM(YomboModule):
 
             self._handle_StandardDirect_LightStatusResponse(responseBytes)
 
-        # if waitEvent and foundCommandHash:
-        if foundCommandHash:
-        #     waitEvent.set()
+        if waitEvent and foundCommandHash:
+            waitEvent.set()
             try:
                 del self._pendingCommandDetails[foundCommandHash]
                 logger.debug("Command {foundCommandHash} completed", foundCommandHash=foundCommandHash)
@@ -997,7 +968,7 @@ class InsteonPLM(YomboModule):
         logger.info("{responseBytes}", responseBytes=self.hex_dump(responseBytes))
 
         foundCommandHash = None
-#        waitEvent = None
+        waitEvent = None
 
         return
 
@@ -1041,11 +1012,11 @@ class InsteonPLM(YomboModule):
                                 if extraReturnData:
                                     returnData = dict(returnData.items() + extraReturnData.items())
 
- #                               if requestCycleDone:
- #                                   waitEvent = commandDetails['waitEvent']
+                                if requestCycleDone:
+                                    waitEvent = commandDetails['waitEvent']
                             else:
                                 logger.warn("No callBack for insteon command code {insteonCommandCode}", insteonCommandCode=insteonCommandCode)
-#                                waitEvent = commandDetails['waitEvent']
+                                waitEvent = commandDetails['waitEvent']
                         else:
                             logger.warn("No insteonCommand lookup defined for insteon command code {insteonCommandCode}", insteonCommandCode=insteonCommandCode)
 
@@ -1059,46 +1030,49 @@ class InsteonPLM(YomboModule):
             logger.warn("Unhandled packet (couldn't find any pending command to deal with it)")
             logger.warn("This could be a status message from a broadcast")
 
-        # if waitEvent and foundCommandHash:
         if waitEvent and foundCommandHash:
-        #     waitEvent.set()
+            waitEvent.set()
             del self._pendingCommandDetails[foundCommandHash]
             logger.debug("Command {foundCommandHash} completed", foundCommandHash=foundCommandHash)
 
     def _process_InboundX10Message(self, responseBytes):
+        if self.x10support is False:
+            logger.warn("InsteonPLM has disabled support for X10 processing.")
         "Receive Handler for X10 Data"
-        logger.warn("zzz")
         unitCode = None
         commandCode = None
         (byteB, byteC) = struct.unpack('xxBB', responseBytes)
         logger.debug("X10> {hexDump}", hexDump=self.hex_dump(responseBytes, len(responseBytes)))
         houseCode =     (byteB & 0b11110000) >> 4
         houseCodeDec = self._x10HouseCodes.get_key(houseCode)
+        houseCodeDec = houseCodeDec.upper()
+        if houseCodeDec != self.lastHouseCode:
+            self.x10stack.clear()
+        self.lastHouseCode = houseCodeDec
         logger.info("X10> HouseCode {houseCodeDec}", houseCodeDec=houseCodeDec )
         unitCmd = (byteC & 0b10000000) >> 7
-        if unitCmd == 0 :
+        if unitCmd == 0 : ## X10 house/unit received (no command)
             unitCode = (byteB & 0b00001111)
             unitCodeDec = self._x10UnitCodes.get_key(unitCode)
             logger.info("X10> UnitCode {unitCodeDec}", unitCodeDec=unitCodeDec )
-            self.lastUnit = unitCodeDec
-        else:
+
+            address = "%s%s" % (houseCodeDec, unitCodeDec)
+            if address in self.X10APIModule.x10devices:
+              if houseCodeDec in self.x10stack:
+                self.x10stack[houseCodeDec].append(unitCodeDec)
+              else:
+                self.x10stack[houseCodeDec] = [unitCodeDec, ]
+        else: ## X10 house/function received (no unit, applies to all units in stack
             commandCode = (byteB & 0b00001111)
             commandCodeDec = self._x10Commands.get_key(commandCode)
-            logger.info("X10> Command: house: {houseCodeDec} unit: {lastunit} command: {command}", houseCodeDec=houseCodeDec, lastunit=self.lastUnit,  command=commandCodeDec  )
-            destDeviceId = houseCodeDec.upper() + self.lastUnit
-            if self._devices:
-                for d in self._devices:
-                    if d.address.upper() == destDeviceId:
-                        # only run the command if the state is different than current
-                        if (commandCode == 0x03 and d.state != State.OFF):     # Never seen one not go to zero but...
-                            self._onCommand(address=destDeviceId, command=State.OFF)
-                        elif (commandCode == 0x02 and d.state != State.ON):   # some times these don't go to 0xFF
-                            self._onCommand(address=destDeviceId, command=State.ON)
-            else: # No devices to check state, so send anyway
-                if (commandCode == 0x03 ):     # Never seen one not go to zero but...
-                    self._onCommand(address=destDeviceId, command=State.OFF)
-                elif (commandCode == 0x02):   # some times these don't go to 0xFF
-                    self._onCommand(address=destDeviceId, command=State.ON)
+            logger.info("X10> house: {houseCodeDec} command: {command}", houseCodeDec=houseCodeDec, lastunit=self.lastUnit,  command=commandCodeDec  )
+
+            if houseCodeDec in self.x10stack:
+              for unit in self.x10stack[houseCodeDec]:
+                logger.warn("set '{houseCodeDec}{unit}' to: {commandCodeDec}", houseCodeDec=houseCodeDec, unit=unit, commandCodeDec=commandCodeDec)
+#                self.X10APIModule.statusUpdate(houseCodeDec=houseCodeDec, unit=unit, commandCodeDec=commandCodeDec)
+#              del self.x10stack[houseCodeDec]
+
 
     def _process_InboundX10Message2(self, responseBytes):
         "Receive Handler for X10 Data"
@@ -1234,8 +1208,8 @@ class InsteonPLM(YomboModule):
                         cmd1 = commandDetails['commandId1']  # example SD11
                         cmd2 = commandDetails['commandId2']
                         deviceId = commandDetails['destinationDevice']
-#                        waitEvent = commandDetails['waitEvent']
-#                        waitEvent.set()
+                        waitEvent = commandDetails['waitEvent']
+                        waitEvent.set()
                         del self._pendingCommandDetails[commandHash]
                         while commandHash in self.cmdQueueList:
                             self.cmdQueueList.remove(commandHash)
@@ -1312,16 +1286,15 @@ class InsteonPLM(YomboModule):
 
     def command(self, incommingcommand, timeout=None):
         command = incommingcommand.command.lower()
-        logger.debug("what: {what}", what = incommingcommand.dump())
-        if incommingcommand.device_class == "insteon":
+        logger.warn("what: {what}", what = incommingcommand.dump())
+        if incommingcommand.deviceobj.deviceClass == "insteon":
             commandExecutionDetails = self._sendStandardP2PInsteonCommand(incommingcommand.address, "%02x" % (self._command[command]['primary']['insteon']), "%02x" % (self._command[command]['secondary']['insteon']))
-            #print "commandExecutionDetails: %s" % commandExecutionDetails
-#            logger.info("InsteonA" + commandExecutionDetails)
-        elif incommingcommand.device_class == "x10":
+            logger.info("InsteonA" + commandExecutionDetails)
+        elif incommingcommand.deviceobj.deviceClass == "x10":
             commandExecutionDetails = self._sendStandardP2PX10Command(address,"%02x" % (self._command[command]['primary']['x10']))
-#            logger.debug("X10A" + commandExecutionDetails)
+            logger.debug("X10A" + commandExecutionDetails)
         else:
-            logger.warn("Unknown device_class: {device_class}", device_class=incommingcommand.device_class)
+            logger.warning("Unknown deviceclass: {deviceClass}", deviceClass=incommingcommand.deviceobj.deviceClass)
             return False
         return self._waitForCommandToFinish(commandExecutionDetails, timeout = timeout)
 
@@ -1513,7 +1486,7 @@ class InsteonPLM(YomboModule):
                     if commandDetails.has_key('destinationDevice'):
                         destDeviceId = commandDetails['destinationDevice']
 
-                    # waitEvent = commandDetails['waitEvent']
+                    waitEvent = commandDetails['waitEvent']
                     foundCommandHash = commandHash
                     break
 
@@ -1521,10 +1494,9 @@ class InsteonPLM(YomboModule):
             logger.warn("Unhandled packet (couldn't find any pending command to deal with it)")
             logger.warn("This could be an unsolocicited broadcast message")
 
-        # if waitEvent and foundCommandHash:
         if waitEvent and foundCommandHash:
-            # time.sleep(1.0)  # wait for a bit befor resending the command.
-            # waitEvent.set()
+            time.sleep(1.0)  # wait for a bit befor resending the command.
+            waitEvent.set()
             del self._pendingCommandDetails[foundCommandHash]
 
         else:
@@ -1554,7 +1526,7 @@ class InsteonPLM(YomboModule):
                 #if commandDetails.has_key('destinationDevice'):
                 #    destDeviceId = commandDetails['destinationDevice']
 
-                # waitEvent = commandDetails['waitEvent']
+                waitEvent = commandDetails['waitEvent']
                 foundCommandHash = commandHash
                 break
 
@@ -1562,9 +1534,8 @@ class InsteonPLM(YomboModule):
             logger.warn("Unhandled packet (couldn't find any pending command to deal with it)")
             logger.warn("All Link - This could be an unsolocicited broadcast message")
 
-        # if waitEvent and foundCommandHash:
-        if foundCommandHash:
-            # waitEvent.set()
+        if waitEvent and foundCommandHash:
+            waitEvent.set()
             del self._pendingCommandDetails[foundCommandHash]
             #self._sendStandardAllLinkInsteonCommand(destDeviceId, originatingCommandId1[2:], originatingCommandId2)
             self._sendStandardP2PInsteonCommand(destDeviceId, originatingCommandId1[2:], originatingCommandId2)
@@ -1622,14 +1593,13 @@ class InsteonPLMSerialProtocol(Protocol):
         self._ModUrl = "http://www.yombo.net"
 
         self.factory = factory  #insteon PLM module from above
+        self.factory.PLMProtocol = self
         self.sendQueue = deque()
         self.__buffer = deque()
         self._sendDataDefer = None
-        self.factory._serialProtocol = self
 
     def connectionFailed(self):
         logger.warn("Insteon connection failed!!")
-
 
     def connectionMade(self):
         logger.debug("Connected to Insteon PLM")
@@ -1641,29 +1611,31 @@ class InsteonPLMSerialProtocol(Protocol):
 
     def dataReceived(self, newdata):
         self.__buffer.extend(list(newdata))
-#        print "@@@@@: %s" % self.__buffer
+        print "@@@@@: %s" % self.__buffer
         if self._sendDataDefer != None:
             self._sendDataDefer.cancel()
 
-        self._sendDataDefer = reactor.callLater(0.2, self.notifyData)
+        self._sendDataDefer = reactor.callLater(0.001, self.notifyData)
 
     def readData(self, numbytes):
         tempData = ''
         if len(self.__buffer) >= numbytes:
             for x in range(0,numbytes):
                 tempData = tempData + self.__buffer.popleft()
-#        print "@!!!: %s" % self.__buffer
+        print "@!!!: %s" % self.__buffer
         return tempData
 
     def notifyData(self):
         tempBuffer = self.__buffer
         self._sendDataDefer = None
         self.factory._readInterface('')
+        if len(self.__buffer) > 0:
+            self._sendDataDefer = reactor.callLater(0.001, self.notifyData)
 
 
     def send(self, data):
-        logger.debug("Sending to insteon: {data}", data=data)
-        self.transport.write(data)
+#        logger.debug("Sendline to homevision: %s", line)
+        self.transport.write("data")
 
 
 class Lookup(dict):
@@ -1691,80 +1663,3 @@ class Lookup(dict):
         """find the value given a key"""
         return self[key]
 
-class Conversions(object):
-    @staticmethod
-    def hex_to_ascii(hex_string):
-        return binascii.unhexlify(hex_string)
-
-    @staticmethod
-    def ascii_to_hex(hex_string):
-        return binascii.hexlify(hex_string)
-
-    @staticmethod
-    def hex_to_bytes( hexStr ):
-        """
-        Convert a string hex byte values into a byte string. The Hex Byte values may
-        or may not be space separated.
-        """
-        # The list comprehension implementation is fractionally slower in this case
-        #
-        #    hexStr = ''.join( hexStr.split(" ") )
-        #    return ''.join( ["%c" % chr( int ( hexStr[i:i+2],16 ) ) \
-        #                                   for i in range(0, len( hexStr ), 2) ] )
-
-        bytes = []
-
-        hexStr = ''.join( hexStr.split(" ") )
-
-        for i in range(0, len(hexStr), 2):
-            bytes.append( chr( int (hexStr[i:i+2], 16 ) ) )
-
-        return ''.join( bytes )
-
-    @staticmethod
-    def int_to_ascii(integer):
-#        ascii = str(unichr(integer))
-        ascii = chr(integer)
-        return ascii
-
-    @staticmethod
-    def hex_to_int(char):
-        return Conversions.ascii_to_int(Conversions.hex_to_bytes(char))
-
-    @staticmethod
-    def int_to_hex(integer):
-        return "%0.2X" % integer
-
-    @staticmethod
-    def ascii_to_int(char):
-        return ord(char)
-
-    ## http://code.activestate.com/recipes/142812/ }}}
-    @staticmethod
-    def hex_dump(src, length=8):
-        result = ''
-        try:
-            N=0;
-            while src:
-                s,src = src[:length],src[length:]
-                hexa = ' '.join(["%02X"%ord(x) for x in s])
-                s = s.translate(FILTER)
-                result += "%04X   %-*s   %s\n" % (N, length*3, hexa, s)
-                N+=length
-        except Exception, ex:
-            pass
-        return result
-
-    @staticmethod
-    def checksum2(data):
-        return reduce(lambda x,y:x+y, map(ord, data)) % 256
-
-    @staticmethod
-    def checksum(data):
-        cs = 0
-        for byte in data:
-            cs = cs + Conversions.ascii_to_int(byte)
-        cs = ~cs
-        cs = cs + 1
-        cs = cs & 255
-        return cs
