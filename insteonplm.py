@@ -4,32 +4,7 @@
 Insteon PLM
 ===========
 
-This file is an adaptation of the pytomation
-(https://github.com/zonyl/pytomation) from the interfaces/insteon.py file.  It
-has been adapted to work with Yombo Gateway. Specifically, this file is from
-git hash: b7e3dd762a6b3d14b5ffc5e6b37f4b62a9b3f676
-
-Original authors:
-
-* Pyjamasam@github <>
-* Jason Sharpee <jason@sharpee.com>  http://www.sharpee.com
-* George Farris <farrisg@gmsys.com>
-
-* Based loosely on the Insteon_PLM.pm code:
-
-  * Expanded by Gregg Liming <gregg@limings.net>
-
-This module interfaces between the Insteon API module and an Insteon
-PLM module plugged into the local gateway. During installation, the
-user will be prompted to enter information to locate the Insteon
-PLM device on the local gateway.
-
-Parts of this file are from the x10heyu module as well as PyInsteon.
-As such, this file is not distributed as part of the Yombo gateway software,
-due to licensing requirements, but as a seperate download to be optionally
-installed seperately at the users request.
-
-Insteon Interface for the following PLMs:
+Provides support for Insteon devices.
 
 License
 =======
@@ -51,1720 +26,247 @@ Implements
 - InsteonPLM
 
 .. moduleauthor:: Mitch Schwenk <mitch-gw@yombo.net>
-:copyright: Copyright 2012-2013 by Yombo.
+:copyright: Copyright 2012-2017 by Yombo.
 :license: GPL(v1)
-:organization: `Yombo <http://www.yombo.net>`_
+:organization: `Yombo <https://yombo.net>`_
 """
+import logging
 from collections import deque
-import binascii
-import hashlib
-import struct
-from serial.serialutil import SerialException
-import time
-import binascii
-import struct
-import hashlib
-from collections import deque
-import traceback
+log = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
-from twisted.internet import utils, reactor
-from twisted.internet.task import LoopingCall
-from twisted.internet.protocol import Protocol
-from twisted.internet.serialport import SerialPort
+from twisted.internet import reactor
+from twisted.internet.defer import ensureDeferred, inlineCallbacks, Deferred, DeferredList
 
 from yombo.core.module import YomboModule
 from yombo.core.log import get_logger
-from yombo.utils.lookupdict import LookupDict
+from yombo.utils import translate_int_value
+
+from yombo.modules.insteonplm import plm
+from yombo.modules.insteonplm.plm.plm import Address, PLMProtocol, Message
 
 logger = get_logger("modules.insteonplm")
-
-def _byteIdToStringId(idHigh, idMid, idLow):
-    return '%02X.%02X.%02X' % (idHigh, idMid, idLow)
-
-
-def _cleanStringId(stringId):
-    return stringId[0:2] + stringId[3:5] + stringId[6:8]
-
-
-def _stringIdToByteIds(stringId):
-    return binascii.unhexlify(_cleanStringId(stringId))
-
-
-def _buildFlags(stdOrExt=None):
-    #todo: impliment this
-    if stdOrExt:
-        return '\x1f'  # Extended command
-    else:
-        return '\x0f'  # Standard command
-
-
-def hashPacket(packetData):
-    return hashlib.md5(packetData).hexdigest()
-
-
-def simpleMap(value, in_min, in_max, out_min, out_max):
-    #stolen from the arduino implimentation.  I am sure there is a nice python way to do it, but I have yet to stublem across it
-    return (float(value) - float(in_min)) * (float(out_max) - float(out_min)) / (float(in_max) - float(in_min)) + float(out_min);
-
-
-class State(object):
-    ALL = 'all'
-    UNKNOWN = 'unknown'
-    ON = 'on'
-    OFF = 'off'
-    LEVEL = 'level'
-    SETPOINT = 'setpoint'
-    MOTION = 'motion'
-    STILL = 'still'
-    OPEN = 'open'
-    CLOSED = "close"
-    LIGHT = "light"
-    DARK = "dark"
-    ACTIVE = 'active'
-    INACTIVE = 'inactive'
-    OCCUPIED = 'occupied'
-    VACANT = 'vacant'
-    HEAT = 'heat'
-    COOL = 'cool'
-    CIRCULATE = 'circulate'
-    AUTOMATIC = 'automatic'
-    HOLD = 'hold'
-
-'''
-KEYPADLINC Information
-
-D1   Button or Group number
-D2   Controls sending data to device
-D3   Button's LED follow mask  - 0x00 - 0xFF
-D4   Button's LED-off mask  - 0x00 - 0xFF
-D5   X10 House code, we don't support
-D6   X10 Unit code, we don't support
-D7   Button's Ramp rate - 0x00 - 0x1F
-D8   Button's ON Level  - 0x00 - 0xFF
-D9   Global LED Brightness - 0x11 - 0x7F
-D10  Non-toggle Bitmap If bit = 0, associated button is Toggle, If bit = 1, button is Non-toggle - 0x00 - 0xFF
-D11  Button-LED State Bitmap If bit = 0, associated button's LED is Off, If bit = 1 button's LED is On - 0x00-0xFF
-D12  X10 all bitmap
-D13  Button Non-Toggle On/Off bitmap, 0 if non-toggle sends Off, 1 if non-toggle sends On
-D14  Button Trigger-ALL-Link Bitmap If bit = 0, associated button sends normal Command If bit = 0, button sends ED 0x30 Trigger ALL-Link Command to first device in ALDB
-
-D2 = 01  Is response to a get data request
-     02  Set LED follow mask, D3 0x00-0xFF, D4-D14 unused set to 0x00
-     03  Set LED off mask, D3 0x00-0xFF, D4-D14 unused set to 0x00
-     04  Set X10 address for button - unsupported
-     05  Set Ramp rate for button, D3 0x00-0x1F, D4-D14 unused set to 0x00
-     06  Set ON Level for button, D3 0x00-0x1F, D4-D14 unused set to 0x00
-     07  Set Global LED brightness, D3 0x11-0x7F, D4-D14 unused set to 0x00
-     08  Set Non-Toggle state for button, D3 0x00-0x01, D4-D14 unused set to 0x00
-     09  Set LED state for button, D3 0x00-0x01, D4-D14 unused set to 0x00
-     0A  Set X10 all on - unsupported
-     0B  Set Non-Toggle ON/OFF state for button, D3 0x00-0x01, D4-D14 unused set to 0x00
-     0C  Set Trigger-ALL-Link State for button, D3 0x00-0x01, D4-D14 unused set to 0x00
-     0D-FF Unused
-
-00 01 20 00 00 20 00 00 3F 00 03 00 00 00  Main button ON
- 1     3     5     7     9    11    13     A1 button ON
-
-00 01 20 00 00 20 00 00 3F 00 C0 00 00 00  Main button OFF
-00 01 20 00 00 20 00 00 3F 00 C4 00 00 00  A ON
-00 01 20 00 00 20 00 00 3F 00 C8 00 00 00  B ON
-00 01 20 00 00 20 00 00 3F 00 CC 00 00 00  A and B ON
-00 01 20 00 00 20 00 00 3F 00 D0 00 00 00  C ON
-00 01 20 00 00 20 00 00 3F 00 D4 00 00 00  A and C ON
-00 01 20 00 00 20 00 00 3F 00 DC 00 00 00  A, B and C ON
-'''
 
 
 class InsteonPLM(YomboModule):
     """
     The primary class...
     """
-    #pytomation items
-    #(address:engineVersion) engineVersion 0x00=i1, 0x01=i2, 0x02=i2cs
-    deviceList = {}         # Dynamically built list of devices [address,devcat,subcat,firmware,engine,name]
-    currentCommand = ""
-    cmdQueueList = []   	# List of orphaned commands that need to be dealt with
-    spinTime = 0.1   		# _readInterface loop time
-    extendedCommand = False	# if extended command ack expected from PLM
-    statusRequest = False   # Set to True when we do a status request
-    lastUnit = ""		# last seen X10 unit code
 
-    def _init_(self):
-        # logger.info("&&&&: Insteon Module Devices: %s" % self._Devices)
-        # logger.info("&&&&: Insteon Module DeviceTypes: %s" % self._DeviceTypes)
-        self._ModDescription = "Insteon command interface"
-        self._ModAuthor = "Mitch Schwenk @ Yombo"
-        self._ModUrl = "http://www.yombo.net"
+    _insteon_commands = {
+        0x11: 'on',
+        0x12: 'on_fast',
+        0x13: 'off',
+        0x14: 'off_fast',
+    }
 
+    _insteon_commands_lookup = {
+        'on': {
+            'insteon': 0x11,
+            'x10': 0x02,
+        },
+        'faston': {
+            'insteon': 0x12,
+            'x10': 0x02,
+        },
+        'off': {
+            'insteon': 0x13,
+            'x10': 0x03,
+        },
+        'fastoff':{
+            'insteon': 0x14,
+            'x10': 0x03,
+        },
+        'level': {
+            'insteon': 0x11,
+            'x10': 0x10,
+        },
+    }
+
+    def _init_(self, **kwargs):
+        self.load_deferred = None  # Prevents loader from moving on past _start_ until we are done.
+        self.load_deferred_dl = None  # Prevents loader from moving on past _start_ until we are done.
         self.startable = False # track when load has completed...
-        self.pending = False
-        self.queue = deque()
-        self.checkQueueLoop = LoopingCall(self.checkQueue)
-        self.writeloop = LoopingCall(self._writeInterface)
-        self._outboundQueue = deque()
-        self._outboundCommandDetails = dict()
-        self._retryCount = dict()
-        self._readBuffer = ''
-        self._serialProtocol = None
-        #pytomation items
-        # Response sizes do not include the start of message (0x02) and the command
-        self._pendingCommandDetails = dict()
-        self._outboundQueue = deque()
-        self._outboundCommandDetails = dict()
-        self._retryCount = dict()
-        self._commandReturnData = dict()
-
-        self._intersend_delay = 0.15  # 150 ms between network sends
-        self._lastSendTime = 0
-
-        self._commandDelegates = []
-        self._devices = []
-        self._lastPacketHash = None
-        self._modemCommands = {'60': {  # Get IM Info
-                                    'responseSize' : 7,
-                                    'callBack' : self._process_PLMInfo
-                                  },
-                                '61': { # Send All Link Command
-                                    'responseSize' : 4,
-                                    'callBack' : self._process_StandardInsteonMessagePLMEcho
-                                  },
-                                '62': { # Send Standard or Extended Message
-                                    'responseSize' : 7,
-                                    'callBack' : self._process_StandardInsteonMessagePLMEcho
-                                  },
-                                '63': { # Send X10
-                                    'responseSize' : 3,
-                                    'callBack' : self._process_StandardX10MessagePLMEcho
-                                  },
-                                '64': { # Start All Linking
-                                    'responseSize' : 3,
-                                    'callBack' : self._process_StandardInsteonMessagePLMEcho
-                                  },
-                                '65': { # Cancel All Linking
-                                    'responseSize' : 1,
-                                    'callBack' : self._process_StandardInsteonMessagePLMEcho
-                                  },
-                                '69': { # Get First All Link Record
-                                    'responseSize' : 1,
-                                    'callBack' : self._process_StandardInsteonMessagePLMEcho
-                                  },
-                                '6A': { # Get Next All Link Record
-                                    'responseSize' : 1,
-                                    'callBack' : self._process_StandardInsteonMessagePLMEcho
-                                  },
-                                '50': { # Received Standard Message
-                                    'responseSize' : 9,
-                                    'callBack' : self._process_InboundStandardInsteonMessage
-                                  },
-                                '51': { # Received Extended Message
-                                    'responseSize' : 23,
-                                    'callBack' : self._process_InboundExtendedInsteonMessage
-                                  },
-                                '52': { # Received X10
-                                    'responseSize' : 2, # originally 3
-                                    'callBack' : self._process_InboundX10Message
-                                 },
-                                '56': { # All Link Record Response
-                                    'responseSize' : 4,
-                                    'callBack' : self._process_InboundAllLinkCleanupFailureReport
-                                  },
-                                '57': { # All Link Record Response
-                                    'responseSize' : 8,
-                                    'callBack' : self._process_InboundAllLinkRecordResponse
-                                  },
-                                '58': { # All Link Record Response
-                                    'responseSize':1,
-                                    'callBack':self._process_InboundAllLinkCleanupStatusReport
-                                  },
-                            }
-        self._modemExtCommands = {'62': { # Send Standard or Extended Message
-                                    'responseSize': 21,
-                                    'callBack':self._process_ExtendedInsteonMessagePLMEcho
-                                  },
-                            }
-
-        self._insteonCommands = {
-                                    #Direct Messages/Responses
-                                    'SD03': {        #Product Data Request (generally an Ack)
-                                        'callBack' : self._handle_StandardDirect_IgnoreAck,
-                                        'validResponseCommands' : ['SD03']
-                                    },
-                                    'SD0D': {        #Get InsteonPLM Engine
-                                        'callBack' : self._handle_StandardDirect_EngineResponse,
-                                        'validResponseCommands' : ['SD0D']
-                                    },
-                                    'SD0F': {        #Ping Device
-                                        'callBack' : self._handle_StandardDirect_AckCompletesCommand,
-                                        'validResponseCommands' : ['SD0F']
-                                    },
-                                    'SD10': {        #ID Request    (generally an Ack)
-                                        'callBack' : self._handle_StandardDirect_IgnoreAck,
-                                        'validResponseCommands' : ['SD10', 'SB01']
-                                    },
-                                    'SD11': {        #Devce On
-                                        'callBack' : self._handle_StandardDirect_AckCompletesCommand,
-                                        'validResponseCommands' : ['SD11', 'SDFF', 'SD00']
-                                    },
-                                    'SD12': {        #Devce On Fast
-                                        'callBack' : self._handle_StandardDirect_AckCompletesCommand,
-                                        'validResponseCommands' : ['SD12']
-                                    },
-                                    'SD13': {        #Devce Off
-                                        'callBack' : self._handle_StandardDirect_AckCompletesCommand,
-                                        'validResponseCommands' : ['SD13']
-                                    },
-                                    'SD14': {        #Devce Off Fast
-                                        'callBack' : self._handle_StandardDirect_AckCompletesCommand,
-                                        'validResponseCommands' : ['SD14']
-                                    },
-                                    'SD15': {        #Brighten one step
-                                        'callBack' : self._handle_StandardDirect_AckCompletesCommand,
-                                        'validResponseCommands' : ['SD15']
-                                    },
-                                    'SD16': {        #Dim one step
-                                        'callBack' : self._handle_StandardDirect_AckCompletesCommand,
-                                        'validResponseCommands' : ['SD16']
-                                    },
-                                    'SD19': {        #Light Status Response
-                                        'callBack' : self._handle_StandardDirect_LightStatusResponse,
-                                        'validResponseCommands' : ['SD19']
-                                    },
-                                    'SD2E': {        #Light Status Response
-                                        'callBack' : self._handle_StandardDirect_AckCompletesCommand,
-                                        'validResponseCommands' : ['SD2E']
-                                    },
-
-				    #X10 Commands
-                                    'XD03': {        #Light Status Response
-                                        'callBack' : self._handle_StandardDirect_AckCompletesCommand,
-                                        'validResponseCommands' : ['XD03']
-                                    },
-
-                                    #Broadcast Messages/Responses
-                                    'SB01': {
-                                                    #Set button pushed
-                                        'callBack' : self._handle_StandardBroadcast_SetButtonPressed
-                                    },
-                                    'SBXX12': {
-                                                    #Fast On Command
-                                        'callBack' : self._handle_StandardBroadcast_SetButtonPressed,
-                                        'validResponseCommands' : ['SB12']
-                                    },
-                                    'SBXX14': {
-                                                    #Fast Off Command
-                                        'callBack' : self._handle_StandardBroadcast_SetButtonPressed,
-                                        'validResponseCommands' : ['SB14']
-                                    },
-
-                                    #Unknown - Seems to be light level report
-                                    'SDFF': {
-                                             },
-                                    'SD00': {
-                                             },
-                                }
-
-        self._x10HouseCodes = Lookup(zip((
-                            'm',
-                            'e',
-                            'c',
-                            'k',
-                            'o',
-                            'g',
-                            'a',
-                            'i',
-                            'n',
-                            'f',
-                            'd',
-                            'l',
-                            'p',
-                            'h',
-                            'n',
-                            'j' ),xrange(0x0, 0xF)))
-
-        self._x10UnitCodes = Lookup(zip((
-                             '13',
-                             '5',
-                             '3',
-                             '11',
-                             '15',
-                             '7',
-                             '1',
-                             '9',
-                             '14',
-                             '6',
-                             '4',
-                             '12',
-                             '16',
-                             '8',
-                             '2',
-                             '10'
-                             ),xrange(0x0,0xF)))
-
-        self._x10Commands = Lookup(zip((
-                             'allUnitsOff',
-                             'allLightsOn',
-                             'on',
-                             'off',
-                             'dim',
-                             'bright',
-                             'allLightsOff',
-                             'ext1',
-                             'hail',
-                             'hailAck',
-                             'ext3',
-                             'unused1',
-                             'ext2',
-                             'statusOn',
-                             'statusOff',
-                             'statusReq'
-                             ),xrange(0x0,0xF)))
-
-        self._command = LookupDict(
-            {
-                       'on'         :{'primary' : {
-                                                    'insteon':0x11,
-                                                    'x10':0x02,
-                                                    'upb':0x00
-                                                  },
-                                     'secondary' : {
-                                                    'insteon':0xff,
-                                                    'x10':None,
-                                                    'upb':None
-                                                    },
-                                     },
-                       'faston'    :{'primary' : {
-                                                    'insteon':0x12,
-                                                    'x10':0x02,
-                                                    'upb':0x00
-                                                  },
-                                     'secondary' : {
-                                                    'insteon':0xff,
-                                                    'x10':None,
-                                                    'upb':None
-                                                    },
-                                     },
-                       'off'         :{'primary' : {
-                                                    'insteon':0x13,
-                                                    'x10':0x03,
-                                                    'upb':0x00
-                                                  },
-                                     'secondary' : {
-                                                    'insteon':0x00,
-                                                    'x10':None,
-                                                    'upb':None
-                                                    },
-                                     },
-
-                       'fastoff'    :{'primary' : {
-                                                    'insteon':0x14,
-                                                    'x10':0x03,
-                                                    'upb':0x00
-                                                  },
-                                     'secondary' : {
-                                                    'insteon':0x00,
-                                                    'x10':None,
-                                                    'upb':None
-                                                    },
-                                     },
-                       'level'    :{'primary' : {
-                                                    'insteon':0x11,
-                                                    'x10':0x0a,
-                                                    'upb':0x00
-                                                  },
-                                     'secondary' : {
-                                                    'insteon':0x88,
-                                                    'x10':None,
-                                                    'upb':None
-                                                    },
-                                     },
-            })
-
-#        self._allLinkDatabase = dict()
-        self._intersend_delay = 0.85 #850ms between network sends
-
-        # This maps Yombo Commands to Insteon Commands. TODO: Add more Yombo Commands to match.
-        self.functionToInsteon = {
-          'ON'            : 'SD11',
-          'OFF'           : 'SD13',
-          'DIM'           : 'SD15',
-          'BRIGHTEN'      : 'SD16',
-          'MICRO_DIM'     : 'SD15',
-          'MICRO_BRIGHTEN': 'SD16' }
-
-        self.__pendingCommandDetails = dict()
-        self.__running = False
-        self.__loaded = False
-        self.__lastPacketHash = None
-
-        self._buffer = ''
-
-        self._attempts = 0
-        self._interval = 3
-        self._baudrate = '19200'
-        self._connected = False
-        self._hasStarted = False # true if self.start has been called
-        self.insteonCmds = {}
-
-    def _load_(self):
-        self.APIModule = self._Modules['InsteonAPI']
-        logger.debug("######== {modvars}", modvars=self._ModuleVariables);
-
-        self.PLMType = "serial"  #serial, network, etc etc later...
-        print self._ModuleVariables
-        self.PLMAddress = self._ModuleVariables['port']['data'][0]['value']
-
-#todo: convert to exception
-        if self.PLMAddress is None:
-            logger.error("InsteonPLM cannot load, PLM address empty.")
-            return
-        return self._startConnection()
-
-    def _startConnection(self):
-        """serial
-        Make the actual connection to the PLM device..
-        """
-        if self.PLMType == "serial":
-          try:
-            self.SerialInterface = SerialPort(InsteonPLMSerialProtocol(self), self.PLMAddress, reactor, baudrate='19200')
-            self._connected = True
-          except SerialException, error:
-            self._attempts += 1
-#            if self._attempts % 50 ==1:
-#                logger.warn("Unable to connect to InsteonPLM serial port. Will continue trying. Attempt: {attempts}, Reason: {error}", attempts=self._attempts, error=error)
-            reactor.callLater(self._interval, self._startConnection)
-          self.__running = True
-          self.__loaded = True
-        else:
-            logger.warn("That connection method dosn't exist yet.")
-
-    def connected(self):
-        """
-        Called by the interface protocol once connected..
-        """
-        pass
-
-    def _start_(self):
-        self._hasStarted = True
-        if self._connected is True:
-            self.checkQueueLoop.start(2)
-            self.writeloop.start(0.1)
-
-    def _stop_(self):
-        pass
-
-    def _unload_(self):
-        self.__loaded = False
-
-        self.__running = False
-        return
-
-    def insteonapi_send_command(self, insteonCmd):
-        """
-        Commands from Insteon API come into here. They need to be processed
-        and sent to interface.
-        """
-#        logger.debug("x10cmds: %s", self.APIModule.x10cmds)
-
-        self.insteonCmds[insteonCmd.originalMessage.msgUUID] = insteonCmd
-        logger.debug("insteonCommnd: {icmd}", icmd=insteonCmd.deviceobj)
-
-        self.command(insteonCmd)
-
-    def checkQueue(self):
-        if self.pending is False:
-            if len(self.queue) > 0:
-                self.pending = True
-                newitem = self.queue.pop()
-                self._send(newitem)
-
-    #pytomation items
-    def _waitForCommandToFinish(self, commandExecutionDetails, timeout=None):
-
-        if type(commandExecutionDetails) != type(dict()):
-            logger.error("Unable to wait without a valid commandExecutionDetails parameter")
-            return False
-
-        # waitEvent = commandExecutionDetails['waitEvent']
-        commandHash = commandExecutionDetails['commandHash']
-
-        realTimeout = 2  # default timeout of 2 seconds
-        if timeout:
-            realTimeout = timeout
-
-        timeoutOccured = False
-
-        # sleep(realTimeout)
-
-        # if not timeoutOccured:
-        #     if commandHash in self._commandReturnData:
-        #         return self._commandReturnData[commandHash]
-        #     else:
-        #         return True
-        # else:
-            #re-queue the command to try again
-            # self._commandLock.acquire()
-
-        if self._retryCount[commandHash] >= 5:
-            #too many retries.  Bail out
-            # self._commandLock.release()
-            return False
-
-#        logger.debug("Timed out for {commandhash}            (commandHash, self._retryCount[commandHash]))
-
-        requiresRetry = True
-        if commandHash in self._pendingCommandDetails:
-            self._outboundCommandDetails[commandHash] = \
-                self._pendingCommandDetails[commandHash]
-
-            del self._pendingCommandDetails[commandHash]
-
-            self._outboundQueue.append(commandHash)
-            self._retryCount[commandHash] += 1
-        else:
-            logger.debug("Interesting.  timed out for {commandHash}, but there are no pending command details", commandHash=commandHash)
-            #to prevent a huge loop here we bail out
-            requiresRetry = False
-
-        # try:
-        #     self._logger.debug("Removing Lock " + str( self._commandLock))
-        #     # self._commandLock.release()
-        # except:
-        #     self._logger.error("Could not release Lock! " + str(self._commandLock))
-
-        if requiresRetry:
-            return self._waitForCommandToFinish(commandExecutionDetails,
-                                                timeout=timeout)
-        else:
-            return False
-
-
-    def _sendInterfaceCommand(self, modemCommand, commandDataString = None, extraCommandDetails = None):
-        self.currentCommand = [modemCommand, commandDataString, extraCommandDetails]
-        modemCommand = binascii.unhexlify(modemCommand)
-        bytesToSend = ''
-        returnValue = False
-        try:
-#            bytesToSend = self.MODEM_PREFIX + binascii.unhexlify(modemCommand)
-            bytesToSend = '\x02' + modemCommand
-            if commandDataString != None:
-                bytesToSend += commandDataString
-            commandHash = hashPacket(bytesToSend)
-
-            if commandHash in self._outboundCommandDetails:
-                #duplicate command.  Ignore
-                pass
-
-            else:
-                basicCommandDetails = {'bytesToSend': bytesToSend,
-                                       'modemCommand': modemCommand}
-
-                if extraCommandDetails != None:
-                    basicCommandDetails = dict(
-                                       basicCommandDetails.items() + \
-                                       extraCommandDetails.items())
-
-                self._outboundCommandDetails[commandHash] = basicCommandDetails
-
-                self._outboundQueue.append(commandHash)
-                self._retryCount[commandHash] = 0
-
-                logger.debug("Queued: {commandHash}", commandHash=commandHash)
-
-                returnValue = {'commandHash': commandHash}
-
-        except Exception, ex:
-            print traceback.format_exc()
-
-        return returnValue
-
-    def _writeInterface(self):
-        #check to see if there are any outbound messages to deal with
-        # self._commandLock.acquire()
-        if self._outboundQueue and (len(self._outboundQueue) > 0) and \
-            (time.time() - self._lastSendTime > self._intersend_delay):
-            commandHash = self._outboundQueue.popleft()
-
-            try:
-                commandExecutionDetails = self._outboundCommandDetails[commandHash]
-            except Exception, ex:
-                logger.error('Could not find execution details: {command} {error}'.format(
-                                                                                                command=commandHash,
-                                                                                                error=str(ex))
-                                   )
-            else:
-                bytesToSend = commandExecutionDetails['bytesToSend']
-
-    #            self._logger.debug("Transmit>" + str(hex_dump(bytesToSend, len(bytesToSend))))
-                try:
-                    logger.debug("Transmit>" + Conversions.ascii_to_hex(bytesToSend))
-                except:
-                    logger.debug("Transmit>" + str(bytesToSend))
-
-#                result = self._interface.write(bytesToSend)
-                result = self._writeInterfaceFinal(bytesToSend)
-                logger.debug("TransmitResult>" + str(result))
-
-                self._pendingCommandDetails[commandHash] = commandExecutionDetails
-                del self._outboundCommandDetails[commandHash]
-
-                self._lastSendTime = time.time()
-
-        # try:
-        #     self._commandLock.release()
-        # except Exception, te:
-        #     self._logger.debug("Error trying to release unlocked lock %s" % (str(te)))
-
-    def _writeInterfaceFinal(self, data):
-        return self._serialProtocol.send(data)
-
-
-    def _readInterface(self, lastPacketHash):
-        #check to see if there is anyting we need to read
-        firstByte = self._serialProtocol.readData(1)
-        logger.debug("firstByte: {firstByte}", firstByte=firstByte)
-#        return
-
-        try:
-            if len(firstByte) == 1:
-                #got at least one byte.  Check to see what kind of byte it is (helps us sort out how many bytes we need to read now)
-
-                if firstByte[0] == '\x02':
-                    #modem command (could be an echo or a response)
-                    #read another byte to sort that out
-                    secondByte = self._serialProtocol.readData(1)
-                    logger.debug("secondByte: {secondByte}", secondByte=secondByte)
-
-                    responseSize = -1
-                    callBack = None
-
-                    if self.extendedCommand:
-                        # set the callback and response size expected for extended commands
-                        modemCommand = binascii.hexlify(secondByte).upper()
-                        if self._modemExtCommands.has_key(modemCommand):
-                            if self._modemExtCommands[modemCommand].has_key('responseSize'):
-                                responseSize = self._modemExtCommands[modemCommand]['responseSize']
-                            if self._modemExtCommands[modemCommand].has_key('callBack'):
-                                callBack = self._modemExtCommands[modemCommand]['callBack']
-
-                    else:
-                        # set the callback and response size expected for standard commands
-                        modemCommand = binascii.hexlify(secondByte).upper()
-                        logger.debug("bbb: modemCommand= {modemCommand}", modemCommand=modemCommand)
-
-                        if self._modemCommands.has_key(modemCommand):
-                            if self._modemCommands[modemCommand].has_key('responseSize'):
-                                responseSize = self._modemCommands[modemCommand]['responseSize']
-                            if self._modemCommands[modemCommand].has_key('callBack'):
-                                callBack = self._modemCommands[modemCommand]['callBack']
-
-                    if responseSize != -1:
-                        remainingBytes = self._serialProtocol.readData(responseSize)
-                        logger.debug("{responseSize} remainingBytes: {remainingBytes}", responseSize=responseSize, remainingBytes=remainingBytes)
-                        currentPacketHash = hashPacket(firstByte + secondByte + remainingBytes)
-                        logger.debug("Receive< " + self.hex_dump(firstByte + secondByte + remainingBytes, len(firstByte + secondByte + remainingBytes)) + currentPacketHash + "\n")
-
-                        if lastPacketHash and lastPacketHash == currentPacketHash:
-                            logger.debug("bbb")
-                            #duplicate packet.  Ignore
-                            pass
-                        else:
-                            logger.debug("ccc")
-                            if callBack:
-                                logger.debug("ddd")
-                                callBack(firstByte + secondByte + remainingBytes)
-                            else:
-                                logger.debug("eee")
-                                logger.debug("No callBack defined for for modem command {modemCommand}", modemCommand=modemCommand)
-
-                        self._lastPacketHash = currentPacketHash
-                        self.spinTime = 0.2     #reset spin time, there were no naks, Don't set this lower
-                    else:
-                        logger.debug("No responseSize defined for modem command {modemCommand}", modemCommand=modemCommand)
-
-                elif firstByte[0] == '\x15':
-                    self.spinTime += 0.2
-                    logger.debug("Received a Modem NAK! Resending command, loop time {spinTime}", spinTime=self.spinTime)
-                    if self.spinTime < 12.0:
-                        self._sendInterfaceCommand(self.currentCommand[0], self.currentCommand[1], self.currentCommand[2])
-                    else:
-                        logger.debug("Too many NAK's! Device not responding...")
-                else:
-                    logger.debug("Unknown first byte {firstByte}", firstByte=binascii.hexlify(firstByte[0]))
-
-                self.extendedCommand = False	# go back to standard commands as default
-
-            else:
-                self._checkCommandQueue()
-                #print "Sleeping"
-                #X10 is slow.  Need to adjust based on protocol sent.  Or pay attention to NAK and auto adjust
-                # sleep(self.spinTime)
-        except TypeError, ex:
-            pass
-
-    def _sendStandardP2PInsteonCommand(self, destinationDevice, commandId1, commandId2):
-        logger.debug("Command: {destinationDevice} {comandID1} {commandID2}", destinationDevice=destinationDevice, comandID1=commandId1, commandID2=commandId2)
-        return self._sendInterfaceCommand('62', _stringIdToByteIds(destinationDevice) + _buildFlags() + binascii.unhexlify(commandId1) + binascii.unhexlify(commandId2), extraCommandDetails = { 'destinationDevice': destinationDevice, 'commandId1': 'SD' + commandId1, 'commandId2': commandId2})
-
-    def _sendStandardAllLinkInsteonCommand(self, destinationGroup, commandId1, commandId2):
-        logger.debug("Command: {destinationGroup} {comandID1} {commandID2}", destinationGroup=destinationGroup, comandID1=commandId1, commandID2=commandId2)
-        return self._sendInterfaceCommand('61', binascii.unhexlify(destinationGroup) + binascii.unhexlify(commandId1) + binascii.unhexlify(commandId2),
-                extraCommandDetails = { 'destinationDevice': destinationGroup, 'commandId1': 'SD' + commandId1, 'commandId2': commandId2})
-
-    def _getX10UnitCommand(self,deviceId):
-        "Send just an X10 unit code message"
-        deviceId = deviceId.lower()
-        return "%02x00" % ((self._x10HouseCodes[deviceId[0:1]] << 4) | self._x10UnitCodes[deviceId[1:2]])
-
-    def _getX10CommandCommand(self,deviceId,commandCode):
-        "Send just an X10 command code message"
-        deviceId = deviceId.lower()
-        return "%02x80" % ((self._x10HouseCodes[deviceId[0:1]] << 4) | int(commandCode,16))
-
-    def _sendStandardP2PX10Command(self,destinationDevice,commandId1, commandId2 = None):
-        # X10 sends 1 complete message in two commands
-        logger.debug("Command: {destinationDevice} {comandID1} {commandID2}", destinationDevice=destinationDevice, comandID1=commandId1, commandID2=commandId2)
-        logger.debug("C: {getX10Command}", getX10Command=self._getX10UnitCommand(destinationDevice))
-        logger.debug("c1: {getX10CommandCommand}", getX10CommandCommand=self._getX10CommandCommand(destinationDevice, commandId1))
-
-        self._sendInterfaceCommand('63', binascii.unhexlify(self._getX10UnitCommand(destinationDevice)))
-
-        return self._sendInterfaceCommand('63', binascii.unhexlify(self._getX10CommandCommand(destinationDevice, commandId1)))
-
-    #low level processing methods
-    def _process_PLMInfo(self, responseBytes):
-        (modemCommand, InsteonCommand, idHigh, idMid, idLow, deviceCat, deviceSubCat, firmwareVer, acknak) = struct.unpack('BBBBBBBBB', responseBytes)
-
-        foundCommandHash = None
-        #find our pending command in the list so we can say that we're done (if we are running in syncronous mode - if not well then the caller didn't care)
-        for (commandHash, commandDetails) in self._pendingCommandDetails.items():
-#            if binascii.unhexlify(commandDetails['modemCommand']) == chr(modemCommand):
-            if commandDetails['modemCommand'] == '\x60':
-                #Looks like this is our command.  Lets deal with it
-                #self._commandReturnData[commandHash] = { 'id': _byteIdToStringId(idHigh,idMid,idLow), 'deviceCategory': '%02X' % deviceCat, 'deviceSubCategory': '%02X' % deviceSubCat, 'firmwareVersion': '%02X' % firmwareVer }
-                self.plmAddress = _byteIdToStringId(idHigh,idMid,idLow).upper()
-
-#                waitEvent = commandDetails['waitEvent']
-#                waitEvent.set()
-
-                foundCommandHash = commandHash
-                break
-
-        if foundCommandHash:
-            del self._pendingCommandDetails[foundCommandHash]
-        else:
-            logger.warn("Unable to find pending command details for the following packet: {hexdump}", hexdump=self.hex_dump(responseBytes, len(responseBytes)))
-
-    def _process_StandardInsteonMessagePLMEcho(self, responseBytes):
-        #print utilities.hex_dump(responseBytes, len(responseBytes))
-        #echoed standard message is always 9 bytes with the 6th byte being the command
-        #here we handle a status request as a special case the very next received message from the
-        #PLM will most likely be the status response.
-        if ord(responseBytes[1]) == 0x62:
-            if len(responseBytes) == 9:  # check for proper length
-                if ord(responseBytes[6]) == 0x19 and ord(responseBytes[8]) == 0x06:  # get a light level status
-                    self.statusRequest = True
-
-    def _process_StandardX10MessagePLMEcho(self, responseBytes):
-        # Just ack / error echo from sending an X10 command
-        pass
-
-    def _validResponseMessagesForCommandId(self, commandId):
-        logger.debug('ValidResponseCheck: {commandID}', commandID=self.hex_dump(commandId))
-        if self._insteonCommands.has_key(commandId):
-            commandInfo = self._insteonCommands[commandId]
-            logger.debug('ValidResponseCheck2: {commandInfo}', commandInfo=str(commandInfo))
-            if commandInfo.has_key('validResponseCommands'):
-                logger.debug('ValidResponseCheck3: {validResponseCommands}', validResponseCommands=str(commandInfo['validResponseCommands']))
-                return commandInfo['validResponseCommands']
-
-        return False
-
-    def _process_InboundStandardInsteonMessage(self, responseBytes):
-        if len(responseBytes) != 11:
-            logger.error("responseBytes< {hexDump}", hexDump=self.hex_dump(responseBytes, len(responseBytes)) + "\n")
-            logger.error("Command incorrect length. Expected 11, Received {responseBytes}", responseBytes=len(responseBytes))
+        self.call_later_set_and_hold = None
+        self.plm_history = deque([], 50)
+        self.status = True  # InsteonAPI checks this..
+        self.insteonapi = None  # pointer to the insteon api module.
+        self.ready = False
+
+    def _start_(self, **kwargs):
+        print("aaaaaa11")
+        if self.insteonapi is None:
+            logger.error("Insteon PLM module doesn't have required Insteon API module. Disabling PLM.")
             return
 
-        (modemCommand, insteonCommand, fromIdHigh, fromIdMid, fromIdLow, toIdHigh, toIdMid, toIdLow, messageFlags, command1, command2) = struct.unpack('BBBBBBBBBBB', responseBytes)
+        print("aaaaaa22")
+        d1 = self.connect_plm()
+        self.load_deferred = Deferred()
+        self.load_deferred_dl = DeferredList(d1, self.load_deferred)
+        print("aaaaaa33")
+        return self.load_deferred_dl
 
-        foundCommandHash = None
-        waitEvent = None
+    @inlineCallbacks
+    def connect_plm(self):
+        print("bbbbb")
+        try:
+            serial_port = self._ModuleVariables['port']['values'][0]
+        except:
+            serial_port = '/dev/insteon'
+        print("bbbbb111")
 
-        #check to see what kind of message this was (based on message flags)
-        isBroadcast = messageFlags & (1 << 7) == (1 << 7)
-        isDirect = not isBroadcast
-        isAck = messageFlags & (1 << 5) == (1 << 5)
-        isNak = isAck and isBroadcast
+        self.plm_connection = yield ensureDeferred(
+            plm.Connection.create(device=serial_port, loop=self._event_loop))
+        print("bbbbb112")
+        self.plm_protocol = self.plm_connection.protocol
+        self.plm_devices = self.plm_connection.protocol.devices._devices
+        self.plm_protocol.add_poll_completed_callback(self.plm_poll_completed)
+        self.plm_protocol.add_update_callback(self.plm_update_device, {})
+        self.plm_protocol.add_message_callback(self.plm_set_and_hold, {'code': 0x54, 'event': 0x03})
+        self.ready = True
 
-        insteonCommandCode = "%02X" % command1
-        if isBroadcast:
-            #standard broadcast
-            insteonCommandCode = 'SB' + insteonCommandCode
+    def plm_poll_completed(self):
+        if self.load_deferred_dl is not None and self.load_deferred_dl.called is False:
+            self.load_deferred_dl.callback(10)
+
+    def _stop_(self, **kwargs):
+        if self.load_deferred is not None and self.load_deferred.called is False:
+            self.load_deferred.callback(1)  # if we don't check for this, we can't stop!
+        if self.load_deferred_dl is not None and self.load_deferred_dl.called is False:
+            self.load_deferred_dl.callback(1)  # if we don't check for this, we can't stop!
+
+    def insteonapi_init(self, insteonapi):  # the api module giving us a reference to itself.
+        self.insteonapi = insteonapi
+
+    def insteonplm_insteonapi_interfaces(self, **kwargs):
+        """
+        This is a hook implemented by the Insteon api module. This simply tells the Insteon API module that we can support
+        Insteon device interactions.
+
+        :param kwargs: 
+        :return: 
+        """
+        try:
+            priority = self._ModuleVariables['port']['values'][0]
+        except:
+            priority = 0
+
+        # logger.warn("Registering Insteon PLM with Insteon API as priority 0.")
+        return {'priority': priority, 'module': self}
+
+    def device_command(self, **kwargs):
+        """
+        Called by the insteonapi module to send a command.
+        :param kwargs: 
+        :return: 
+        """
+        logger.warn("in device_command. Ready: {ready}", ready=self.ready)
+        if self.ready is False:
+            return ('failed', 'PLM interface not ready.')
+        device = kwargs['device']
+        command = kwargs['command']
+        inputs = kwargs['inputs']
+        request_id = kwargs['request_id']
+
+        device_variables = device.device_variables
+        address = Address(device_variables['address']['values'][0])
+        # print("plm plm_devices: %s" % self.plm_devices)
+        # print("plm device_variables: %s" % device_variables)
+        plm_device = self.plm_devices[address.hex]
+
+        do_command = command.machine_label
+
+        fast = do_command.endswith('fast')
+
+
+        if 'brightness' in inputs:
+            brightness = inputs['brightness']
+        elif 'percent' in inputs:
+            brightness = translate_int_value(inputs['percent'], 0, 100, 0, 255)
         else:
-            #standard direct
-            insteonCommandCode = 'SD' + insteonCommandCode
+            brightness = 255
 
-        if self.statusRequest:
-            insteonCommandCode = 'SD19'
+        if 'ramprate' in inputs:
+            ramprate = inputs['ramprate']
+        else:
+            ramprate = None
 
-            #this is a strange special case...
-            #lightStatusRequest returns a standard message and overwrites the cmd1 and cmd2 bytes with "data"
-            #cmd1 (that we use here to sort out what kind of incoming message we got) contains an
-            #"ALL-Link Database Delta number that increments every time there is a change in the addressee's ALL-Link Database"
-            #which makes is super hard to deal with this response (cause cmd1 can likley change)
-            #for now my testing has show that its 0 (at least with my dimmer switch - my guess is cause I haven't linked it with anything)
-            #so we treat the SD00 message special and pretend its really a SD19 message (and that works fine for now cause we only really
-            #care about cmd2 - as it has our light status in it)
-#            insteonCommandCode = 'SD19'
+        if do_command.startswith('on'):
+            # else:
+            #     brightness = 255
+            self.plm_protocol.turn_on(address, brightness=brightness, ramprate=ramprate, fast=fast)
+        elif do_command == 'set_brightness':
+            self.plm_protocol.turn_on(address, brightness=brightness)
+        elif do_command == 'brighten':
+            brightness = self.insteonapi.devices[address.human]['onlevel'] + 26  # about 11-12 steps
+            self.plm_protocol.turn_on(address, brightness=brightness)
+        elif do_command == 'dim':
+            brightness = self.insteonapi.devices[address.human]['onlevel'] - 26  # about 11-12 steps
+            self.plm_protocol.turn_on(address, brightness=brightness)
+        elif do_command == 'dim_start':
+            self.plm_protocol.send_insteon_standard(plm_device, '23', '00')
+        elif do_command == 'dim_stop':
+            self.plm_protocol.send_insteon_standard(plm_device, '24', '00')
+        elif do_command == 'dim_start':
+            self.plm_protocol.send_insteon_standard(plm_device, '23', '01')
+        elif do_command == 'dim_stop':
+            self.plm_protocol.send_insteon_standard(plm_device, '24', '01')
+        elif do_command.startswith('off'):
+            fast = do_command.endswith('fast')
+            self.plm_protocol.turn_off(address, ramprate=ramprate, fast=fast)
+        else:
+            return ('failed', 'Unknown command: %s' % do_command)
 
-        #print insteonCommandCode
+        return ('done', 'Command delivered to PLM interface.')
 
-        #find our pending command in the list so we can say that we're done (if we are running in syncronous mode - if not well then the caller didn't care)
-        for (commandHash, commandDetails) in self._pendingCommandDetails.items():
-            #since this was a standard insteon message the modem command used to send it was a 0x62 so we check for that
-#            if binascii.unhexlify(commandDetails['modemCommand']) == '\x62':
-            if commandDetails['modemCommand'] == '\x62':
-                originatingCommandId1 = None
-                if commandDetails.has_key('commandId1'):
-                    originatingCommandId1 = commandDetails['commandId1']
+    def get_plm_device(self, address):
+        address = Address(address)
+        # print("address: %s -> %s"  % (addr, address.__dict__))
+        device = self.devices[address.hex]
 
-                validResponseMessages = self._validResponseMessagesForCommandId(originatingCommandId1)
-                if validResponseMessages and len(validResponseMessages):
-                    #Check to see if this received command is one that this pending command is waiting for
-                    logger.debug('Valid Insteon Command Code: {insteonCommandCode}', insteonCommandCode=str(insteonCommandCode))
-                    if validResponseMessages.count(insteonCommandCode) == 0:
-                        #this pending command isn't waiting for a response with this command code...  Move along
-                        continue
-                else:
-                    logger.warn("Unable to find a list of valid response messages for command {originatingCommandId1}", originatingCommandId1=originatingCommandId1)
-                    continue
+    def get_found_devices(self):
+        """
+        Called by Insteon API to get all devices linked to the PLM device.
+        
+        :return: 
+        """
+        results = {}
+        for address, device in self.plm_devices.items():
+            results[device['address']] = device
+        return results
 
-                #since there could be multiple insteon messages flying out over the wire, check to see if this one is
-                #from the device we sent this command to
-                destDeviceId = None
-                if commandDetails.has_key('destinationDevice'):
-                    destDeviceId = commandDetails['destinationDevice']
-
-                if destDeviceId:
-                    if destDeviceId.upper() == _byteIdToStringId(fromIdHigh, fromIdMid, fromIdLow).upper():
-
-                        returnData = {} #{'isBroadcast': isBroadcast, 'isDirect': isDirect, 'isAck': isAck}
-
-                        #try and look up a handler for this command code
-                        if self._insteonCommands.has_key(insteonCommandCode):
-                            if self._insteonCommands[insteonCommandCode].has_key('callBack'):
-                                # Run the callback
-                                (requestCycleDone, extraReturnData) = self._insteonCommands[insteonCommandCode]['callBack'](responseBytes)
-                                self.statusRequest = False
-
-                                if extraReturnData:
-                                    returnData = dict(returnData.items() + extraReturnData.items())
-
-#                                if requestCycleDone:
-#                                    waitEvent = commandDetails['waitEvent']
-                            else:
-                                logger.warn("No callBack for insteon command code {insteonCommandCode}", insteonCommandCode=insteonCommandCode)
-#                                waitEvent = commandDetails['waitEvent']
-                        else:
-                            logger.warn("No insteonCommand lookup defined for insteon command code {insteonCommandCode}", insteonCommandCode=insteonCommandCode)
-
-                        if len(returnData):
-                            self._commandReturnData[commandHash] = returnData
-
-                        foundCommandHash = commandHash
-                        break
-
-        if foundCommandHash is None:
-            logger.warn("Unhandled packet (couldn't find any pending command to deal with it)")
-            logger.warn("This could be a status message from a broadcast")
-            # very few things cause this certainly a scene on or off will so that's what we assume
-
-            self._handle_StandardDirect_LightStatusResponse(responseBytes)
-
-        # if waitEvent and foundCommandHash:
-        if foundCommandHash:
-        #     waitEvent.set()
+    def plm_set_and_hold(self, message):
+        """
+        The PLM device had it's set button pressed for a while. Lets update the device list after a bit.
+        :param message: 
+        :return: 
+        """
+        # print("got a plm set and hold: %s" % message)
+        if self.call_later_set_and_hold is not None:
             try:
-                del self._pendingCommandDetails[foundCommandHash]
-                logger.debug("Command {foundCommandHash} completed", foundCommandHash=foundCommandHash)
+                self.call_later_set_and_hold.cancel()
             except:
-                logger.error("Command {foundCommandHash} couldnt be deleted!", foundCommandHash=foundCommandHash)
+                pass
+        self.call_later_set_and_hold = reactor.callLater(3, self.plm_protocol.load_all_link_database)
+        # print("Devices: %s" % self.plm_devices )
 
-    def _process_InboundExtendedInsteonMessage(self, responseBytes):
-        (modemCommand, insteonCommand, fromIdHigh, fromIdMid, fromIdLow, toIdHigh, toIdMid, toIdLow, messageFlags, \
-            command1, command2, d1,d2,d3,d4,d5,d6,d7,d8,d9,d10,d11,d12,d13,d14) = struct.unpack('BBBBBBBBBBBBBBBBBBBBBBBBB', responseBytes)
+    def plm_message(self, message):
+        self.plm_history.append(message)
 
-        logger.info("{responseBytes}", responseBytes=self.hex_dump(responseBytes))
+    def plm_update_device(self, message):
+        # print("UYpdate from address: %s"  % message.cmd1)
+        # print("UYpdate from address: %s"  % message.__dict__)
+        device = self.plm_devices[message.address.hex]
+        # print("Update from device: %s" % device)
 
-        foundCommandHash = None
-#        waitEvent = None
-
-        return
-
-        insteonCommandCode = "%02X" % command1
-        insteonCommandCode = 'SD' + insteonCommandCode
-
-        #find our pending command in the list so we can say that we're done (if we are running in syncronous mode - if not well then the caller didn't care)
-        for (commandHash, commandDetails) in self._pendingCommandDetails.items():
-            if commandDetails['modemCommand'] == '\x62':
-                originatingCommandId1 = None
-                if commandDetails.has_key('commandId1'):
-                    originatingCommandId1 = commandDetails['commandId1']    #ex: SD03
-
-                validResponseMessages = self._validResponseMessagesForCommandId(originatingCommandId1)
-                if validResponseMessages and len(validResponseMessages):
-                    #Check to see if this received command is one that this pending command is waiting for
-                    if validResponseMessages.count(insteonCommandCode) == 0:
-                        #this pending command isn't waiting for a response with this command code...  Move along
-                        continue
-                else:
-                    logger.warn("Unable to find a list of valid response messages for command {originatingCommandId1}", originatingCommandId1=originatingCommandId1)
-                    continue
-
-                #since there could be multiple insteon messages flying out over the wire, check to see if this one is
-                #from the device we sent this command to
-                destDeviceId = None
-                if commandDetails.has_key('destinationDevice'):
-                    destDeviceId = commandDetails['destinationDevice']
-
-                if destDeviceId:
-                    if destDeviceId.upper() == _byteIdToStringId(fromIdHigh, fromIdMid, fromIdLow).upper():
-
-                        returnData = {} #{'isBroadcast': isBroadcast, 'isDirect': isDirect, 'isAck': isAck}
-
-                        #try and look up a handler for this command code
-                        if self._insteonCommands.has_key(insteonCommandCode):
-                            if self._insteonCommands[insteonCommandCode].has_key('callBack'):
-                                # Run the callback
-                                (requestCycleDone, extraReturnData) = self._insteonCommands[insteonCommandCode]['callBack'](responseBytes)
-
-                                if extraReturnData:
-                                    returnData = dict(returnData.items() + extraReturnData.items())
-
- #                               if requestCycleDone:
- #                                   waitEvent = commandDetails['waitEvent']
-                            else:
-                                logger.warn("No callBack for insteon command code {insteonCommandCode}", insteonCommandCode=insteonCommandCode)
-#                                waitEvent = commandDetails['waitEvent']
-                        else:
-                            logger.warn("No insteonCommand lookup defined for insteon command code {insteonCommandCode}", insteonCommandCode=insteonCommandCode)
-
-                        if len(returnData):
-                            self._commandReturnData[commandHash] = returnData
-
-                        foundCommandHash = commandHash
-                        break
-
-        if foundCommandHash is None:
-            logger.warn("Unhandled packet (couldn't find any pending command to deal with it)")
-            logger.warn("This could be a status message from a broadcast")
-
-        # if waitEvent and foundCommandHash:
-        if waitEvent and foundCommandHash:
-        #     waitEvent.set()
-            del self._pendingCommandDetails[foundCommandHash]
-            logger.debug("Command {foundCommandHash} completed", foundCommandHash=foundCommandHash)
-
-    def _process_InboundX10Message(self, responseBytes):
-        "Receive Handler for X10 Data"
-        logger.warn("zzz")
-        unitCode = None
-        commandCode = None
-        (byteB, byteC) = struct.unpack('xxBB', responseBytes)
-        logger.debug("X10> {hexDump}", hexDump=self.hex_dump(responseBytes, len(responseBytes)))
-        houseCode =     (byteB & 0b11110000) >> 4
-        houseCodeDec = self._x10HouseCodes.get_key(houseCode)
-        logger.info("X10> HouseCode {houseCodeDec}", houseCodeDec=houseCodeDec )
-        unitCmd = (byteC & 0b10000000) >> 7
-        if unitCmd == 0 :
-            unitCode = (byteB & 0b00001111)
-            unitCodeDec = self._x10UnitCodes.get_key(unitCode)
-            logger.info("X10> UnitCode {unitCodeDec}", unitCodeDec=unitCodeDec )
-            self.lastUnit = unitCodeDec
-        else:
-            commandCode = (byteB & 0b00001111)
-            commandCodeDec = self._x10Commands.get_key(commandCode)
-            logger.info("X10> Command: house: {houseCodeDec} unit: {lastunit} command: {command}", houseCodeDec=houseCodeDec, lastunit=self.lastUnit,  command=commandCodeDec  )
-            destDeviceId = houseCodeDec.upper() + self.lastUnit
-            if self._devices:
-                for d in self._devices:
-                    if d.address.upper() == destDeviceId:
-                        # only run the command if the state is different than current
-                        if (commandCode == 0x03 and d.state != State.OFF):     # Never seen one not go to zero but...
-                            self._onCommand(address=destDeviceId, command=State.OFF)
-                        elif (commandCode == 0x02 and d.state != State.ON):   # some times these don't go to 0xFF
-                            self._onCommand(address=destDeviceId, command=State.ON)
-            else: # No devices to check state, so send anyway
-                if (commandCode == 0x03 ):     # Never seen one not go to zero but...
-                    self._onCommand(address=destDeviceId, command=State.OFF)
-                elif (commandCode == 0x02):   # some times these don't go to 0xFF
-                    self._onCommand(address=destDeviceId, command=State.ON)
-
-    def _process_InboundX10Message2(self, responseBytes):
-        "Receive Handler for X10 Data"
-        #X10 sends commands fully in two separate messages. Not sure how to handle this yet
-        #TODO not implemented
-        unitCode = None
-        commandCode = None
-        logger.debug("X10> " + self.hex_dump(responseBytes, len(responseBytes)))
-             #       (insteonCommand, fromIdHigh, fromIdMid, fromIdLow, toIdHigh, toIdMid, toIdLow, messageFlags, command1, command2) = struct.unpack('xBBBBBBBBBB', responseBytes)
-#        houseCode =     (int(responseBytes[4:6],16) & 0b11110000) >> 4
- #       houseCodeDec = X10_House_Codes.get_key(houseCode)
-#        keyCode =       (int(responseBytes[4:6],16) & 0b00001111)
-#        flag =          int(responseBytes[6:8],16)
-
-    #insteon message handlers
-    def _handle_StandardDirect_IgnoreAck(self, messageBytes):
-        #just ignore the ack for what ever command triggered us
-        #there is most likley more data coming for what ever command we are handling
-        return (False, None)
-
-    def _handle_StandardDirect_AckCompletesCommand(self, messageBytes):
-        #the ack for our command completes things.  So let the system know so
-        return (True, None)
-
-    def _handle_StandardBroadcast_SetButtonPressed(self, messageBytes):
-        #02 50 17 C4 4A 01 19 38 8B 01 00
-        (idHigh, idMid, idLow, deviceCat, deviceSubCat, deviceRevision) = struct.unpack('xxBBBBBBxxx', messageBytes)
-        return (True, {'deviceType': '%02X%02X' % (deviceCat, deviceSubCat), 'deviceRevision':'%02X' % deviceRevision})
-
-    def _handle_StandardDirect_EngineResponse(self, messageBytes):
-        #02 50 17 C4 4A 18 BA 62 2B 0D 01
-        engineVersionIdentifier = messageBytes[10]
-        if engineVersionIdentifier == '\x00':
-            return (True, {'engineVersion': 'i1'})
-        elif engineVersionIdentifier == '\x01':
-            return (True, {'engineVersion': 'i2'})
-        elif engineVersionIdentifier == '\x02':
-            return (True, {'engineVersion': 'i2cs'})
-        else:
-            return (True, {'engineVersion': 'FF'})
-
-    def _handle_StandardDirect_LightStatusResponse(self, messageBytes):
-        (modemCommand, insteonCommand, fromIdHigh, fromIdMid, fromIdLow, toIdHigh, toIdMid, toIdLow, messageFlags, command1, command2) = struct.unpack('BBBBBBBBBBB', messageBytes)
-
-        destDeviceId = _byteIdToStringId(fromIdHigh, fromIdMid, fromIdLow).upper()
-        logger.debug('HandleStandDirect')
-        isGrpCleanupAck = (messageFlags & 0x60) == 0x60
-        isGrpBroadcast = (messageFlags & 0xC0) == 0xC0
-        isGrpCleanupDirect = (messageFlags & 0x40) == 0x40
-        # If we get an ack from a group command fire off a status request or we'll never know the on level (not off)
-        #0x06 = Reserved ... heartbeat?
-        #0x11 = on
-        #0x13 = off
-        #0x19 = light status info (in command2)
-        #0x17 = light level manual change START
-        #0x18 = light level manual change STOP
-        if (isGrpCleanupAck or isGrpBroadcast) and command1 != 0x13 and command1 !=0x11 and command1 != 0x19:
-            if command1 != 0x06 and command1 != 0x17: #don't ask for status on a heartbeat or the start of a manual change
-                logger.debug("Running status request:{isGrpCleanupAck}:{isGrpBroadcast}:{isGrpCleanupDirect}",
-                             isGrpCleanupAck=isGrpCleanupAck, isGrpBroadcast=isGrpBroadcast, isGrpCleanupDirect=isGrpCleanupDirect)
-                self.lightStatusRequest(destDeviceId, async=True)
-            else:
-                logger.debug("Ignoring command: {command1}:{isGrpCleanupAck}:{isGrpBroadcast}:{isGrpCleanupDirect}:..........", command1=command1, isGrpCleanupAck=isGrpCleanupAck, isGrpBroadcast=isGrpBroadcast, isGrpCleanupDirect=isGrpCleanupDirect)
-        else: # direct command
-
-            self._logger.debug("Setting status for:{0}:{1}:{2}..........".format(
-                                                                                 str(destDeviceId),
-                                                                                 str(command1),
-                                                                                 str(command2),
-                                                                                 ))
-            if self._devices:
-                for d in self._devices:
-                    if d.address.upper() == destDeviceId:
-                        # only run the command if the state is different than current
-                        if command1 == 0x13:
-                            if d.state != State.OFF:
-                                self._onCommand(address=destDeviceId, command=State.OFF)
-                        elif command1 == 0x11:
-                            if d.state != State.ON:
-                                if d.verify_on_level:
-                                    logger.debug('Received "On" command and "Verify On Level" set, sending status request for: {destDeviceId}..........', destDeviceI=destDeviceId)
-                                    self.lightStatusRequest(destDeviceId, async=True)
-                                else:
-                                    self._onCommand(address=destDeviceId, command=State.ON)
-                        elif d.state != (State.LEVEL, command2):
-                            if command2 < 0x02: #Off -- Doesn't always go to 0
-                                if d.state != State.OFF:
-                                    self._onCommand(address=destDeviceId, command=State.OFF)
-                            elif command2 > 0xFD: #On -- Doesn't always go to 255
-                                if d.state != State.ON:
-                                    self._onCommand(address=destDeviceId, command=State.ON)
-                            else:
-                                self._onCommand(address=destDeviceId, command=(State.LEVEL, int(command2 / 2.54)))
-            else: # No devices to check state, so send anyway
-                if command1 == 0x13:
-                    if d.state != State.OFF:
-                        self._onCommand(address=destDeviceId, command=State.OFF)
-                elif command1 == 0x11:
-                    if d.state != State.ON:
-                        self._onCommand(address=destDeviceId, command=State.ON)
-                elif command2:
-                    if command2 < 0x02: #Off -- Doesn't always go to 0
-                        self._onCommand(address=destDeviceId, command=State.OFF)
-                    elif command2 > 0xFD: #On -- Doesn't always go to 255
-                        self._onCommand(address=destDeviceId, command=State.ON)
-                    else:
-                        self._onCommand(address=destDeviceId, command=(State.LEVEL, int(command2 / 2.54)))
-
-        self.statusRequest = False
-        return (True,None)
-        # Old stuff, don't use this at the moment
-        #lightLevelRaw = messageBytes[10]
-        #map the lightLevelRaw value to a sane value between 0 and 1
-        #normalizedLightLevel = simpleMap(ord(lightLevelRaw), 0, 255, 0, 1)
-
-        #return (True, {'lightStatus': round(normalizedLightLevel, 2) })
-
-   	# _checkCommandQueue is run every iteration of _readInterface. It counts the commands
-    # to find repeating ones.  If a command is repeated too many times it means it never
-    # received a response so we should delete the original command and delete it from the
-    # queue.  This is a hack and will be dealt with properly in the new driver.
-    def _checkCommandQueue(self):
-        if self._pendingCommandDetails != {}:
-            for (commandHash, commandDetails) in self._pendingCommandDetails.items():
-                self.cmdQueueList.append(commandHash)
-
-                # If we have an orphaned queue it will show up here, get the details, remove the old command
-                # from the queue and re-issue.
-                if self.cmdQueueList.count(commandHash) > 50:
-                    if commandDetails['modemCommand'] in ['\x60','\x61','\x62']:
-                        #print "deleting commandhash ", commandHash
-                        #print commandDetails
-                        cmd1 = commandDetails['commandId1']  # example SD11
-                        cmd2 = commandDetails['commandId2']
-                        deviceId = commandDetails['destinationDevice']
-#                        waitEvent = commandDetails['waitEvent']
-#                        waitEvent.set()
-                        del self._pendingCommandDetails[commandHash]
-                        while commandHash in self.cmdQueueList:
-                            self.cmdQueueList.remove(commandHash)
-                        # Retry the command..Do we really want this?
-                        self._sendStandardP2PInsteonCommand(deviceId, cmd1[2:], cmd2)
-
-    def __getattr__(self, name):
-        name = name.lower()
-        # Support levels of lighting
-        if name[0] == 'l' and len(name) == 3:
-            level = name[1:3]
-            level = int((int(level) / 100.0) * int(0xFF))
-            return lambda x, y=None: self.level(x, level, timeout=y )
-
-
-
-    #---------------------------public methods---------------------------------
-
-    def getPLMInfo(self, timeout = None):
-        commandExecutionDetails = self._sendInterfaceCommand('60')
-
-        return self._waitForCommandToFinish(commandExecutionDetails, timeout = timeout)
-
-    # This doesn't work and ping in Insteon seems broken as far as I can tell.
-    # The ping command 0x0D seems to return an ack from non-existant devices.
-    def pingDevice(self, deviceId, timeout = None):
-        startTime = time.time()
-        commandExecutionDetails = self._sendStandardP2PInsteonCommand(deviceId, '0F', '00')
-
-        #Wait for ping result
-        commandReturnCode = self._waitForCommandToFinish(commandExecutionDetails, timeout = timeout)
-        endTime = time.time()
-
-        if commandReturnCode:
-            return endTime - startTime
-        else:
-            return False
-
-    def idRequest(self, deviceId, timeout = None):
-        if len(deviceId) != 2: #insteon device address
-            commandExecutionDetails = self._sendExtendedP2PInsteonCommand(deviceId, '10', '00', '0')
-            return self._waitForCommandToFinish(commandExecutionDetails, timeout = timeout)
-        return
-
-    def getInsteonEngineVersion(self, deviceId, timeout = None):
-        if len(deviceId) != 2: #insteon device address
-            commandExecutionDetails = self._sendStandardP2PInsteonCommand(deviceId, '0D', '00')
-            return self._waitForCommandToFinish(commandExecutionDetails, timeout = timeout)
-        # X10 device,  command not supported,  just return
-        return
-
-    def getProductData(self, deviceId, timeout = None):
-        if len(deviceId) != 2: #insteon device address
-            commandExecutionDetails = self._sendStandardP2PInsteonCommand(deviceId, '03', '00', )
-            return self._waitForCommandToFinish(commandExecutionDetails, timeout = timeout)
-        # X10 device,  command not supported,  just return
-        return
-
-    def lightStatusRequest(self, deviceId, timeout = None, async = False):
-        if len(deviceId) != 2: #insteon device address
-            commandExecutionDetails = self._sendStandardP2PInsteonCommand(deviceId, '19', '00')
-            if not async:
-                return self._waitForCommandToFinish(commandExecutionDetails, timeout = timeout)
+        # for now, just handle lights...
+        if 'onlevel' not in device:
             return
-        # X10 device,  command not supported,  just return
-        return
 
-    def relayStatusRequest(self, deviceId, timeout = None):
-        if len(deviceId) != 2: #insteon device address
-            commandExecutionDetails = self._sendStandardP2PInsteonCommand(deviceId, '19', '01')
-            return self._waitForCommandToFinish(commandExecutionDetails, timeout = timeout)
-        # X10 device,  command not supported,  just return
-        return
-
-    def command(self, incommingcommand, timeout=None):
-        command = incommingcommand.command.lower()
-        logger.debug("what: {what}", what = incommingcommand.dump())
-        if incommingcommand.device_class == "insteon":
-            commandExecutionDetails = self._sendStandardP2PInsteonCommand(incommingcommand.address, "%02x" % (self._command[command]['primary']['insteon']), "%02x" % (self._command[command]['secondary']['insteon']))
-            #print "commandExecutionDetails: %s" % commandExecutionDetails
-#            logger.info("InsteonA" + commandExecutionDetails)
-        elif incommingcommand.device_class == "x10":
-            commandExecutionDetails = self._sendStandardP2PX10Command(address,"%02x" % (self._command[command]['primary']['x10']))
-#            logger.debug("X10A" + commandExecutionDetails)
+        onlevel = device['onlevel']
+        if onlevel == 0:
+            command_label = 'off'
         else:
-            logger.warn("Unknown device_class: {device_class}", device_class=incommingcommand.device_class)
-            return False
-        return self._waitForCommandToFinish(commandExecutionDetails, timeout = timeout)
+            command_label = 'on'
 
-    def on(self, deviceId, fast=None, timeout = 2.5):
-        if fast == 'fast':
-            cmd = '12'
-        else:
-            cmd = '11'
-        if len(deviceId) != 2: #insteon device address
-            commandExecutionDetails = self._sendStandardP2PInsteonCommand(deviceId, cmd, 'ff')
-        else: #X10 device address
-            commandExecutionDetails = self._sendStandardP2PX10Command(deviceId,'02')
-        return self._waitForCommandToFinish(commandExecutionDetails, timeout = timeout)
-
-    def off(self, deviceId, fast=None, timeout = 2.5):
-        if fast == 'fast':
-            cmd = '14'
-        else:
-            cmd = '13'
-        if len(deviceId) != 2: #insteon device address
-            commandExecutionDetails = self._sendStandardP2PInsteonCommand(deviceId, cmd, '00')
-        else: #X10 device address
-            commandExecutionDetails = self._sendStandardP2PX10Command(deviceId,'03')
-        return self._waitForCommandToFinish(commandExecutionDetails, timeout = timeout)
-
-
-    # if rate the bits 0-3 is 2 x ramprate +1, bits 4-7 on level + 0x0F
-    def level(self, deviceId, level, rate=None, timeout=None):
-        if level > 100 or level <0:
-            logger.error("{name} cannot set light level {level} beyond 1-15".format(
-                                                                                    name=self.name,
-                                                                                    level=level,
-                                                                                     ))
-            return
-        else:
-            if rate is None:
-                # make it 0 to 255
-                level = int((int(level) / 100.0) * int(0xFF))
-                commandExecutionDetails = self._sendStandardP2PInsteonCommand(deviceId, '11', '%02x' % level)
-                return self._waitForCommandToFinish(commandExecutionDetails, timeout=timeout)
-
-            else:
-                if rate > 15 or rate <1:
-                    logger.error("{name} cannot set light ramp rate {rate} beyond 1-15".format(
-                                                                                    name=self.name,
-                                                                                    level=level,
-                                                                                     ))
-                    return
-                else:
-                    lev = int(simpleMap(level, 1, 100, 1, 15))
-                    levelramp = (int(lev) << 4) + rate
-                    commandExecutionDetails = self._sendStandardP2PInsteonCommand(deviceId, '2E', '%02x' % levelramp)
-                    return self._waitForCommandToFinish(commandExecutionDetails, timeout=timeout)
-
-   # # if rate the bits 0-3 is 2 x ramprate +1, bits 4-7 on level + 0x0F
-   #  def level(self, deviceId, level, rate=None, timeout=None):
-   #      if level > 100 or level <0:
-   #          self._logger.error("{name} cannot set light level {level} beyond 1-15".format(
-   #                                                                                  name=self.name,
-   #                                                                                  level=level,
-   #                                                                                   ))
-   #          return
-   #      else:
-   #          if rate is None:
-   #              # make it 0 to 255
-   #              level = int((int(level) / 100.0) * int(0xFF))
-   #              commandExecutionDetails = self._sendStandardP2PInsteonCommand(deviceId, '11', '%02x' % level)
-   #              return self._waitForCommandToFinish(commandExecutionDetails, timeout=timeout)
-   #
-   #          else:
-   #              if rate > 15 or rate <1:
-   #                  self._logger.error("{name} cannot set light ramp rate {rate} beyond 1-15".format(
-   #                                                                                  name=self.name,
-   #                                                                                  level=level,
-   #                                                                                   ))
-   #                  return
-   #              else:
-   #                  lev = int(simpleMap(level, 1, 100, 1, 15))
-   #                  levelramp = (int(lev) << 4) + rate
-   #                  commandExecutionDetails = self._sendStandardP2PInsteonCommand(deviceId, '2E', '%02x' % levelramp)
-   #                  return self._waitForCommandToFinish(commandExecutionDetails, timeout=timeout)
-
-    def level_up(self, deviceId, timeout=None):
-        if len(deviceId) != 2: #insteon device address
-            commandExecutionDetails = self._sendStandardP2PInsteonCommand(deviceId, '15', '00')
-            return self._waitForCommandToFinish(commandExecutionDetails, timeout=timeout)
-        # X10 device,  command not supported,  just return
-        return
-
-    def level_down(self, deviceId, timeout=None):
-        if len(deviceId) != 2: #insteon device address
-            commandExecutionDetails = self._sendStandardP2PInsteonCommand(deviceId, '16', '00')
-            return self._waitForCommandToFinish(commandExecutionDetails, timeout=timeout)
-        # X10 device,  command not supported,  just return
-        return
-
-    def status(self, deviceId, timeout=None):
-        if len(deviceId) != 2: #insteon device address
-            return self.lightStatusRequest(deviceId, timeout, async=True)
-        # X10 device,  command not supported,  just return
-        return
-
-    # Activate scene with the address passed
-    def active(self, address, timeout=None):
-        if len(address) != 2: #insteon device address
-            commandExecutionDetails = self._sendStandardAllLinkInsteonCommand(address, '12', 'FF')
-            return self._waitForCommandToFinish(commandExecutionDetails, timeout = timeout)
-        # X10 device,  command not supported,  just return
-        return
-
-    def inactive(self, address, timeout=None):
-        if len(address) != 2: #insteon device address
-            commandExecutionDetails = self._sendStandardAllLinkInsteonCommand(address, '14', '00')
-            return self._waitForCommandToFinish(commandExecutionDetails, timeout = timeout)
-        # X10 device,  command not supported,  just return
-        return
-
-    def update_status(self):
-        for d in self._devices:
-            if len(d.address) == 8:  # real address not scene
-                print "Getting status for ", d.address
-                self.lightStatusRequest(d.address)
-
-    def update_scene(self, address, devices):
-        # we are passed a scene number to update and a bunch of objects to update
-        for device in devices:
-            for k, v in device.iteritems():
-                print 'This is a device member' + str(k)
-
-    def version(self):
-        logger.info("Insteon Pytomation driver version " + self.VERSION)
-
-
-#**********************************************************************************************
-#
-#   Experimental Insteon stuff
-#
-#-----------------------------------------------------------------------------------------------
-    # yeah of course this doesn't work cause Insteon has 5 year olds writing it's software.
-    def getAllProductData(self):
-        for d in self._devices:
-            if len(d.address) == 8:  # real address not scene
-                print "Getting product data for ", d.address
-                self.RgetProductData(d.address)
-                time.sleep(2.0)
-
-    def getAllIdRequest(self):
-        for d in self._devices:
-            if len(d.address) == 8:  # real address not scene
-                print "Getting product data for ", d.address
-                self.idRequest(d.address)
-                time.sleep(2.0)
-
-
-
-
-    def bitstring(self, s):
-        return str(s) if s<=1 else self.bitstring(s>>1) + str(s&1)
-
-    def _sendExtendedP2PInsteonCommand(self, destinationDevice, commandId1, commandId2, d1_d14):
-        logger.debug("Extended Command: %s %s %s %s" % (destinationDevice, commandId1, commandId2, d1_d14))
-        self.extendedCommand = True
-        return self._sendInterfaceCommand('62', _stringIdToByteIds(destinationDevice) + _buildFlags(self.extendedCommand) + binascii.unhexlify(commandId1) + binascii.unhexlify(commandId2), extraCommandDetails = { 'destinationDevice': destinationDevice, 'commandId1': 'SD' + commandId1, 'commandId2': commandId2})
-
-    def _process_InboundAllLinkRecordResponse(self, responseBytes):
-        #print hex_dump(responseBytes)
-        (modemCommand, insteonCommand, recordFlags, recordGroup, toIdHigh, toIdMid, toIdLow, linkData1, linkData2, linkData3) = struct.unpack('BBBBBBBBBB', responseBytes)
-        #keep the prints commented, for example format only
-        #print "Device    Group Flags     Data1 Data2 Data3"
-        #print "------------------------------------------------"
-        print "%02x.%02x.%02x  %02x    %s  %d    %d    %d" % (toIdHigh, toIdMid, toIdLow, recordGroup,self.bitstring(recordFlags),linkData1, linkData2, linkData3)
-
-    def _process_InboundAllLinkCleanupStatusReport(self, responseBytes):
-        if responseBytes[2] == '\x06':
-            logger.debug("All-Link Cleanup completed...")
-            foundCommandHash = None
-            waitEvent = None
-            for (commandHash, commandDetails) in self._pendingCommandDetails.items():
-                if commandDetails['modemCommand'] == '\x61':
-                    originatingCommandId1 = None
-
-                    if commandDetails.has_key('commandId1'):  #example SD11
-                        originatingCommandId1 = commandDetails['commandId1']  # = SD11
-
-                    if commandDetails.has_key('commandId2'):  #example FF
-                        originatingCommandId2 = commandDetails['commandId2']
-
-                    destDeviceId = None
-                    if commandDetails.has_key('destinationDevice'):
-                        destDeviceId = commandDetails['destinationDevice']
-
-                    # waitEvent = commandDetails['waitEvent']
-                    foundCommandHash = commandHash
-                    break
-
-        if foundCommandHash is None:
-            logger.warn("Unhandled packet (couldn't find any pending command to deal with it)")
-            logger.warn("This could be an unsolocicited broadcast message")
-
-        # if waitEvent and foundCommandHash:
-        if waitEvent and foundCommandHash:
-            # time.sleep(1.0)  # wait for a bit befor resending the command.
-            # waitEvent.set()
-            del self._pendingCommandDetails[foundCommandHash]
-
-        else:
-            logger.debug("All-Link Cleanup received a NAK...")
-
-
-    # The group command failed, lets dig out the original command and issue a direct
-    # command to the failed device. we will also delete the original command from pendingCommandDetails.
-    def _process_InboundAllLinkCleanupFailureReport(self, responseBytes):
-        (modemCommand, insteonCommand, deviceGroup, toIdHigh, toIdMid, toIdLow) = struct.unpack('BBBBBB', responseBytes)
-        logger.debug("All-Link Cleanup Failure, resending command after 1 second...")
-        #find our pending command in the list so we can say that we're done (if we are running in syncronous mode - if not well then the caller didn't care)
-        foundCommandHash = None
-        waitEvent = None
-        for (commandHash, commandDetails) in self._pendingCommandDetails.items():
-            if commandDetails['modemCommand'] == '\x61':
-                originatingCommandId1 = None
-
-                if commandDetails.has_key('commandId1'):  #example SD11
-                    originatingCommandId1 = commandDetails['commandId1']  # = SD11
-
-                if commandDetails.has_key('commandId2'):  #example FF
-                    originatingCommandId2 = commandDetails['commandId2']
-
-                destDeviceId = _byteIdToStringId(toIdHigh, toIdMid, toIdLow)
-                #destDeviceId = None
-                #if commandDetails.has_key('destinationDevice'):
-                #    destDeviceId = commandDetails['destinationDevice']
-
-                # waitEvent = commandDetails['waitEvent']
-                foundCommandHash = commandHash
-                break
-
-        if foundCommandHash is None:
-            logger.warn("Unhandled packet (couldn't find any pending command to deal with it)")
-            logger.warn("All Link - This could be an unsolocicited broadcast message")
-
-        # if waitEvent and foundCommandHash:
-        if foundCommandHash:
-            # waitEvent.set()
-            del self._pendingCommandDetails[foundCommandHash]
-            #self._sendStandardAllLinkInsteonCommand(destDeviceId, originatingCommandId1[2:], originatingCommandId2)
-            self._sendStandardP2PInsteonCommand(destDeviceId, originatingCommandId1[2:], originatingCommandId2)
-
-
-
-    def print_linked_insteon_devices(self):
-        print "Device    Group Flags     Data1 Data2 Data3"
-        print "------------------------------------------------"
-        self.request_first_all_link_record()
-        while self.request_next_all_link_record():
-            time.sleep(0.1)
-
-    def getkeypad(self):
-        destinationDevice='12.BD.CA'
-        commandId1='2E'
-        commandId2='00'
-        d1_d14='0000000000000000000000000000'
-        self.extendedCommand = True
-        return self._sendInterfaceCommand('62', _stringIdToByteIds(destinationDevice) + '\x1F' +
-                binascii.unhexlify(commandId1) + binascii.unhexlify(commandId2) + binascii.unhexlify(d1_d14),
-                extraCommandDetails = { 'destinationDevice': destinationDevice, 'commandId1': 'SD' + commandId1,
-                'commandId2': commandId2})
-
-
-    def request_first_all_link_record(self, timeout=None):
-        commandExecutionDetails = self._sendInterfaceCommand('69')
-        #print "Sending Command 0x69..."
-        return self._waitForCommandToFinish(commandExecutionDetails, timeout = timeout)
-
-
-    def request_next_all_link_record(self, timeout=None):
-        commandExecutionDetails = self._sendInterfaceCommand('6A')
-        #print "Sending Command 0x6A..."
-        return self._waitForCommandToFinish(commandExecutionDetails, timeout = timeout)
-
-
-    def hex_dump(self, src, length=8):
-        N=0; result=''
-        while src:
-            s,src = src[:length],src[length:]
-            hexa = ' '.join(["%02X"%ord(x) for x in s])
-            ## {{{ http://code.activestate.com/recipes/142812/ (r1)
-            filter=''.join([(len(repr(chr(x)))==3) and chr(x) or '.' for x in range(256)])
-            s = s.translate(filter)
-            result += "%04X   %-*s   %s\n" % (N, length*3, hexa, s)
-            N+=length
-        return result
-
-
-class InsteonPLMSerialProtocol(Protocol):
-    def __init__(self, factory):
-        self._ModDescription = "Insteon PLM Serial/USB interface"
-        self._ModAuthor = "Mitch Schwenk @ Yombo"
-        self._ModUrl = "http://www.yombo.net"
-
-        self.factory = factory  #insteon PLM module from above
-        self.sendQueue = deque()
-        self.__buffer = deque()
-        self._sendDataDefer = None
-        self.factory._serialProtocol = self
-
-    def connectionFailed(self):
-        logger.warn("Insteon connection failed!!")
-
-
-    def connectionMade(self):
-        logger.debug("Connected to Insteon PLM")
-#        self.statusCheckTimer.start(15)
-#        self.checkQueueTimer.start(150)
-
-#    def sendStatusCheck(self):
-#        self.sendLine("G00")  #say hello to homevision
-
-    def dataReceived(self, newdata):
-        self.__buffer.extend(list(newdata))
-#        print "@@@@@: %s" % self.__buffer
-        if self._sendDataDefer != None:
-            self._sendDataDefer.cancel()
-
-        self._sendDataDefer = reactor.callLater(0.2, self.notifyData)
-
-    def readData(self, numbytes):
-        tempData = ''
-        if len(self.__buffer) >= numbytes:
-            for x in range(0,numbytes):
-                tempData = tempData + self.__buffer.popleft()
-#        print "@!!!: %s" % self.__buffer
-        return tempData
-
-    def notifyData(self):
-        tempBuffer = self.__buffer
-        self._sendDataDefer = None
-        self.factory._readInterface('')
-
-
-    def send(self, data):
-        logger.debug("Sending to insteon: {data}", data=data)
-        self.transport.write(data)
-
-
-class Lookup(dict):
-    """
-    a dictionary which can lookup value by key, or keys by value
-    # tested with Python25 by Ene Uran 01/19/2008    http://www.daniweb.com/software-development/python/code/217019
-    """
-    def __init__(self, items=[]):
-        """items can be a list of pair_lists or a dictionary"""
-        dict.__init__(self, items)
-
-    def get_key(self, value):
-        """find the key as a list given a value"""
-        if type(value) == type(dict()):
-            items = [item[0] for item in self.items() if item[1][value.items()[0][0]] == value.items()[0][1]]
-        else:
-            items = [item[0] for item in self.items() if item[1] == value]
-        return items[0]
-
-    def get_keys(self, value):
-        """find the key(s) as a list given a value"""
-        return [item[0] for item in self.items() if item[1] == value]
-
-    def get_value(self, key):
-        """find the value given a key"""
-        return self[key]
-
-class Conversions(object):
-    @staticmethod
-    def hex_to_ascii(hex_string):
-        return binascii.unhexlify(hex_string)
-
-    @staticmethod
-    def ascii_to_hex(hex_string):
-        return binascii.hexlify(hex_string)
-
-    @staticmethod
-    def hex_to_bytes( hexStr ):
-        """
-        Convert a string hex byte values into a byte string. The Hex Byte values may
-        or may not be space separated.
-        """
-        # The list comprehension implementation is fractionally slower in this case
-        #
-        #    hexStr = ''.join( hexStr.split(" ") )
-        #    return ''.join( ["%c" % chr( int ( hexStr[i:i+2],16 ) ) \
-        #                                   for i in range(0, len( hexStr ), 2) ] )
-
-        bytes = []
-
-        hexStr = ''.join( hexStr.split(" ") )
-
-        for i in range(0, len(hexStr), 2):
-            bytes.append( chr( int (hexStr[i:i+2], 16 ) ) )
-
-        return ''.join( bytes )
-
-    @staticmethod
-    def int_to_ascii(integer):
-#        ascii = str(unichr(integer))
-        ascii = chr(integer)
-        return ascii
-
-    @staticmethod
-    def hex_to_int(char):
-        return Conversions.ascii_to_int(Conversions.hex_to_bytes(char))
-
-    @staticmethod
-    def int_to_hex(integer):
-        return "%0.2X" % integer
-
-    @staticmethod
-    def ascii_to_int(char):
-        return ord(char)
-
-    ## http://code.activestate.com/recipes/142812/ }}}
-    @staticmethod
-    def hex_dump(src, length=8):
-        result = ''
-        try:
-            N=0;
-            while src:
-                s,src = src[:length],src[length:]
-                hexa = ' '.join(["%02X"%ord(x) for x in s])
-                s = s.translate(FILTER)
-                result += "%04X   %-*s   %s\n" % (N, length*3, hexa, s)
-                N+=length
-        except Exception, ex:
-            pass
-        return result
-
-    @staticmethod
-    def checksum2(data):
-        return reduce(lambda x,y:x+y, map(ord, data)) % 256
-
-    @staticmethod
-    def checksum(data):
-        cs = 0
-        for byte in data:
-            cs = cs + Conversions.ascii_to_int(byte)
-        cs = ~cs
-        cs = cs + 1
-        cs = cs & 255
-        return cs
+        self.insteonapi.insteon_device_update(device, command_label)

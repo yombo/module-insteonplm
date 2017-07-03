@@ -1,11 +1,15 @@
+Summary
+=======
+
+A Yombo module that adds support for sending Insteon commands to the power lines
+through a USB or serial port. An Insteon API module is required.
+
+Additional details about this module at: https://yombo.net/modules/insteonplm/
+
+Learn about [Yombo Gateway](https://yombo.net/).
+
 Usage
 =====
-
-This module extends the capabilities of the `Yombo Gateway <https://yombo.net/>`_
-by adding support for Insteon products.
-
-Insteon Support
-===============
 
 This module is an interface module between the Insteon API module and
 an Insteon PLM. The Insteon API module is required before this module
@@ -14,29 +18,46 @@ can be used.
 Installation
 ============
 
-Simply mark this module as being used by the gateway, and the gateway will
-download and install this module automatically.
+From the Gateway web interface (or other application), simply mark this module
+as being used by the gateway, and the gateway will download and install this
+module automatically.
 
 Requirements
 ============
 
 An Insteon interface module is required to send commands to Insteon devices.
 
+3rd Party Items 
+===============
+This module uses parts of another module "insteonplm" (https://github.com/nugget/python-insteonplm)
+and has a seperate license. See the "readme.md" file inside the plm folder
+for additional details.
+
 License
 =======
 
-This module is free software: you can redistribute it and/or modify
-it under the terms of the GNU General Public License as published by
-the Free Software Foundation, either version 3 of the License, or
-(at your option) any later version.
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
 
-The GNU General Public License can be found here: `GNU.Org <http://www.gnu.org/licenses>`_
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
 
-The `Yombo <https://yombo.net/>`_ team and other contributors
-hopes that it will be useful, but WITHOUT ANY WARRANTY; without even the
-implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
 
-See details below.
+The [Yombo](https://yombo.net/) team and other contributors hopes that it
+will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty
+of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.
+
 
 Disclaimer of Warranty
 ======================

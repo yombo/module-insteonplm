@@ -1,1 +1,1 @@
-from insteonplm import InsteonPLM
+from .insteonplm import InsteonPLM
