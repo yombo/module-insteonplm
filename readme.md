@@ -4,9 +4,10 @@ Summary
 A Yombo module that adds support for sending Insteon commands to the power lines
 through a USB or serial port. An Insteon API module is required.
 
-Additional details about this module at: https://yombo.net/modules/insteonplm/
+Additional details about this module at: https://docs.yombo.net/Modules/insteonplm
 
-Learn about [Yombo Gateway](https://yombo.net/).
+Learn about [Yombo Gateway](https://yombo.net/) or
+[Get started today](https://docs.yombo.net/Gateway/Quick_start)
 
 Usage
 =====

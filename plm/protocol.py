@@ -8,6 +8,9 @@ import binascii
 from .ipdb import IPDB
 from .plm import Address, PLMProtocol, Message
 
+from yombo.core.log import get_logger
+logger = get_logger("modules.insteonplm.plm.protocol")
+
 __all__ = ('PLM', 'ALDB')
 
 PP = PLMProtocol()
@@ -44,7 +47,7 @@ class ALDB(object):
     def __setitem__(self, key, value):
         """Add or Update a device in the ALDB."""
         if 'cat' not in value or value['cat'] == 0:
-            self.log.debug('Ignoring device setitem with no cat: %s', value)
+            logger.debug('Ignoring device setitem with no cat: {value}', value=value)
             return
 
         if key in self._devices:
@@ -59,9 +62,9 @@ class ALDB(object):
             value['onlevel'] = None
             self._devices[key] = value
 
-            self.log.info('New INSTEON Device %r: %s (%02x:%02x)',
-                          Address(key), value['description'], value['cat'],
-                          value['subcat'])
+            logger.debug('New INSTEON Device {address}: {description} ({cat}:{subcat})',
+                          address=Address(key).human, description=value['description'],
+                          cat=value['cat'], subcat=value['subcat'])
 
             self._apply_overrides(key)
 

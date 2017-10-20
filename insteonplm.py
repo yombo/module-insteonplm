@@ -30,10 +30,7 @@ Implements
 :license: GPL(v1)
 :organization: `Yombo <https://yombo.net>`_
 """
-import logging
 from collections import deque
-log = logging.getLogger(__name__)
-logging.basicConfig(level=logging.INFO)
 
 from twisted.internet import reactor
 from twisted.internet.defer import ensureDeferred, inlineCallbacks, Deferred, DeferredList
@@ -94,30 +91,24 @@ class InsteonPLM(YomboModule):
         self.ready = False
 
     def _start_(self, **kwargs):
-        print("aaaaaa11")
         if self.insteonapi is None:
             logger.error("Insteon PLM module doesn't have required Insteon API module. Disabling PLM.")
             return
 
-        print("aaaaaa22")
         d1 = self.connect_plm()
         self.load_deferred = Deferred()
         self.load_deferred_dl = DeferredList(d1, self.load_deferred)
-        print("aaaaaa33")
         return self.load_deferred_dl
 
     @inlineCallbacks
     def connect_plm(self):
-        print("bbbbb")
         try:
             serial_port = self._ModuleVariables['port']['values'][0]
         except:
             serial_port = '/dev/insteon'
-        print("bbbbb111")
 
         self.plm_connection = yield ensureDeferred(
             plm.Connection.create(device=serial_port, loop=self._event_loop))
-        print("bbbbb112")
         self.plm_protocol = self.plm_connection.protocol
         self.plm_devices = self.plm_connection.protocol.devices._devices
         self.plm_protocol.add_poll_completed_callback(self.plm_poll_completed)
@@ -160,7 +151,7 @@ class InsteonPLM(YomboModule):
         :param kwargs: 
         :return: 
         """
-        logger.warn("in device_command. Ready: {ready}", ready=self.ready)
+        logger.debug("in device_command. Ready: {ready}", ready=self.ready)
         if self.ready is False:
             return ('failed', 'PLM interface not ready.')
         device = kwargs['device']
