@@ -1,6 +1,8 @@
 Summary
 =======
 
+The primary repository link: https://github.com/yombo/module-insteon
+
 A Yombo module that adds support for sending Insteon commands to the power lines
 through a USB or serial port. An Insteon API module is required.
 
