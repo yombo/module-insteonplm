@@ -103,7 +103,7 @@ class InsteonPLM(YomboModule):
     @inlineCallbacks
     def connect_plm(self):
         try:
-            serial_port = self._ModuleVariables['port']['values'][0]
+            serial_port = self._module_variables_cached['port']['values'][0]
         except:
             serial_port = '/dev/insteon'
 
@@ -138,7 +138,7 @@ class InsteonPLM(YomboModule):
         :return: 
         """
         try:
-            priority = self._ModuleVariables['port']['values'][0]
+            priority = self._module_variables_cached['port']['values'][0]
         except:
             priority = 0
 
@@ -159,7 +159,7 @@ class InsteonPLM(YomboModule):
         inputs = kwargs['inputs']
         request_id = kwargs['request_id']
 
-        device_variables = device.device_variables
+        device_variables = device.device_variables_cached
         address = Address(device_variables['address']['values'][0])
         # print("plm plm_devices: %s" % self.plm_devices)
         # print("plm device_variables: %s" % device_variables)
@@ -169,16 +169,15 @@ class InsteonPLM(YomboModule):
 
         fast = do_command.endswith('fast')
 
-
         if 'brightness' in inputs:
-            brightness = inputs['brightness']
+            brightness = float(inputs['brightness'])
         elif 'percent' in inputs:
-            brightness = translate_int_value(inputs['percent'], 0, 100, 0, 255)
+            brightness = translate_int_value(float(inputs['percent']), 0, 100, 0, 255)
         else:
             brightness = 255
 
         if 'ramprate' in inputs:
-            ramprate = inputs['ramprate']
+            ramprate = int(inputs['ramprate'])
         else:
             ramprate = None
 

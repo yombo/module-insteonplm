@@ -862,7 +862,7 @@ class PLM(asyncio.Protocol):
 
     def turn_off(self, address, fast=None, ramprate=None):
         """Send command to device to turn off."""
-        if fast == 'fast' or fast == True:
+        if fast == 'fast' or fast is True:
             self.send_insteon_standard(address, '14', '00', {})
         else:
             if ramprate is not None:
@@ -874,11 +874,11 @@ class PLM(asyncio.Protocol):
         """Send command to device to turn on."""
         device = self.devices[address.hex]
         # self.log.debug('turn_on %r %s', address, device.get('model'))
-
         if brightness > 255:
             brightness = 255
         elif brightness < 0:
             brightness = 0
+        brightness = int(brightness)
 
         if ramprate is not None:
             if ramprate > 31:
@@ -895,7 +895,7 @@ class PLM(asyncio.Protocol):
             self.send_insteon_standard(address, cmd, bhex, {})
         else:
             cmd1 = 0x2e
-            cmd2 = (brightness & 0xf0) | ((ramprate & 0x1f) >> 1);
+            cmd2 = (brightness & 0xf0) | ((int(ramprate) & 0x1f) >> 1);
             cmd2 = str.format('{:02X}', int(cmd2)).lower()
             print("cmd2: %s" % cmd2)
             self.send_insteon_standard(address, '2e', cmd2, {})
